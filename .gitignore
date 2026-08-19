@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv*/
+env/
+venv/
+ENV/
+dist/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Ruff
+.ruff_cache/
+
+# Hydra
+.hydra/
+outputs/
+
+# MLflow
+mlruns/
+
+# Weights & Biases
+wandb/
+.wandb/
+
+# Optuna
+optuna.db
+*.db
+
+# Models (large files - use Git LFS if needed)
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.ckpt
+!models/.gitkeep
+
+# Data (raw data should not be committed)
+/data/
+!data/.gitkeep
+
+# Reports
+reports/*.pdf
+reports/*.html
+!reports/.gitkeep
+!reports/figures/.gitkeep
+
+# Logs
+*.log
+logs/
+runs/
+
+# Environment variables
+
+# OS
+.DS_Store
+Thumbs.db
