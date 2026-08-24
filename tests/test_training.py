@@ -1,18 +1,34 @@
 import copy
+import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from minimal_dino.model import SentenceDINO
 from minimal_dino.objective import DINOLoss
-from minimal_dino.train import cosine_teacher_momentum, update_teacher
+from minimal_dino.train import (
+    DEFAULT_MODEL_REVISION,
+    cosine_teacher_momentum,
+    log_metrics,
+    remove_old_periodic_checkpoints,
+    resolve_model_revision,
+    restore_checkpoint,
+    save_checkpoint,
+    update_teacher,
+)
+
+
+class TinyConfig(SimpleNamespace):
+    def to_dict(self):
+        return vars(self)
 
 
 class TinyEncoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(hidden_size=8)
+        self.config = TinyConfig(hidden_size=8)
         self.embedding = nn.Embedding(24, 8)
         self.dropout = nn.Dropout(0.2)
         self.layer = nn.Linear(8, 8)
@@ -62,3 +78,89 @@ def test_teacher_momentum_cosine_schedule_reaches_one():
     assert values[0] == 0.996
     assert values[-1] == 1.0
     assert values == sorted(values)
+
+
+class TinyTokenizer:
+    def save_pretrained(self, path):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def test_checkpoint_round_trip_restores_models_optimizer_center_and_rng(tmp_path):
+    torch.manual_seed(7)
+    student = SentenceDINO(TinyEncoder(), output_dim=12, head_hidden_dim=16, bottleneck_dim=4)
+    teacher = copy.deepcopy(student).eval().requires_grad_(False)
+    objective = DINOLoss(12)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    original_student = copy.deepcopy(student.state_dict())
+    checkpoint = save_checkpoint(
+        tmp_path,
+        student,
+        teacher,
+        objective,
+        optimizer,
+        scheduler,
+        TinyTokenizer(),
+        SimpleNamespace(seed=7),
+        step=3,
+        checkpoint_name="checkpoint-step-3.pt",
+    )
+    expected_random = torch.rand(4)
+
+    with torch.no_grad():
+        next(student.parameters()).add_(10)
+        objective.center.add_(1)
+    step = restore_checkpoint(
+        checkpoint, student, teacher, objective, optimizer, scheduler, torch.device("cpu")
+    )
+    actual_random = torch.rand(4)
+
+    assert step == 3
+    assert all(
+        torch.equal(value, original_student[name]) for name, value in student.state_dict().items()
+    )
+    assert torch.equal(objective.center, torch.zeros_like(objective.center))
+    assert torch.equal(actual_random, expected_random)
+    assert not (tmp_path / "checkpoint-step-3.pt.tmp").exists()
+
+
+def test_periodic_checkpoint_retention_keeps_newest_steps(tmp_path):
+    for step in (100, 300, 200):
+        (tmp_path / f"checkpoint-step-{step}.pt").touch()
+
+    remove_old_periodic_checkpoints(tmp_path, keep_last=2)
+
+    assert not (tmp_path / "checkpoint-step-100.pt").exists()
+    assert (tmp_path / "checkpoint-step-200.pt").exists()
+    assert (tmp_path / "checkpoint-step-300.pt").exists()
+
+
+def test_default_model_resolves_to_immutable_revision():
+    assert resolve_model_revision("bert-base-uncased", None) == DEFAULT_MODEL_REVISION
+
+
+def test_custom_hub_model_requires_revision():
+    with pytest.raises(ValueError, match="--model-revision"):
+        resolve_model_revision("organization/model", None)
+
+
+def test_model_revision_must_be_full_commit_hash():
+    with pytest.raises(ValueError, match="40-character commit hash"):
+        resolve_model_revision("organization/model", "main")
+
+
+def test_local_model_does_not_require_revision(tmp_path):
+    assert resolve_model_revision(str(tmp_path), None) is None
+
+
+def test_log_metrics_matches_stdout_and_appends_jsonl(tmp_path, capsys):
+    first = {"step": 1, "loss": 2.0}
+    second = {"step": 2, "loss": 1.0}
+
+    log_metrics(tmp_path, first)
+    log_metrics(tmp_path, second)
+
+    stdout_lines = capsys.readouterr().out.splitlines()
+    file_lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
+    assert file_lines == stdout_lines
+    assert [json.loads(line) for line in file_lines] == [first, second]

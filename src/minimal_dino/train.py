@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import random
+import re
 import warnings
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,36 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from minimal_dino.data import TextLineDataset, TokenizeCollator
-from minimal_dino.evaluation import evaluate_stsb
+from minimal_dino.evaluation import evaluate_stsb, load_stsb_split
 from minimal_dino.model import SentenceDINO
 from minimal_dino.objective import DINOLoss
+
+DEFAULT_MODEL_NAME = "bert-base-uncased"
+DEFAULT_MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"
+
+
+def log_metrics(output_dir: str | Path, metrics: dict[str, float | int]) -> None:
+    """Emit one metrics record to stdout and the run's append-only JSONL file."""
+    line = json.dumps(metrics, sort_keys=True)
+    print(line, flush=True)
+    path = Path(output_dir) / "metrics.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+        stream.flush()
+
+
+def resolve_model_revision(model_name: str, revision: str | None) -> str | None:
+    """Require immutable revisions for Hub models while allowing local directories."""
+    if revision:
+        if re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+            raise ValueError("--model-revision must be a full 40-character commit hash")
+        return revision
+    if Path(model_name).exists():
+        return None
+    if model_name in {DEFAULT_MODEL_NAME, "google-bert/bert-base-uncased"}:
+        return DEFAULT_MODEL_REVISION
+    raise ValueError("--model-revision is required when --model-name refers to a Hub model")
 
 
 def set_seed(seed: int) -> None:
@@ -84,6 +112,7 @@ def save_checkpoint(
     tokenizer: Any,
     args: argparse.Namespace,
     step: int,
+    checkpoint_name: str = "checkpoint.pt",
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(output_dir / "tokenizer")
@@ -92,7 +121,8 @@ def save_checkpoint(
         "head_hidden_dim": student.head.mlp[0].out_features,
         "bottleneck_dim": student.head.last_weight.shape[1],
     }
-    checkpoint_path = output_dir / "checkpoint.pt"
+    checkpoint_path = output_dir / checkpoint_name
+    temporary_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
     torch.save(
         {
             "student": student.state_dict(),
@@ -102,20 +132,74 @@ def save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "encoder_config": student.encoder.config.to_dict(),
             "head_config": head_config,
+            "pooling": "mean",
             "args": vars(args),
             "step": step,
+            "python_random_state": random.getstate(),
+            "numpy_random_state": np.random.get_state(),
+            "torch_random_state": torch.get_rng_state(),
+            "cuda_random_state": (
+                torch.cuda.get_rng_state(next(student.parameters()).device)
+                if next(student.parameters()).device.type == "cuda"
+                else None
+            ),
         },
-        checkpoint_path,
+        temporary_path,
     )
+    temporary_path.replace(checkpoint_path)
     return checkpoint_path
+
+
+def restore_checkpoint(
+    checkpoint_path: str | Path,
+    student: SentenceDINO,
+    teacher: SentenceDINO,
+    objective: DINOLoss,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    device: torch.device,
+) -> int:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    expected_head_config = {
+        "output_dim": student.head.last_weight.shape[0],
+        "head_hidden_dim": student.head.mlp[0].out_features,
+        "bottleneck_dim": student.head.last_weight.shape[1],
+    }
+    if checkpoint["head_config"] != expected_head_config:
+        raise ValueError("Checkpoint projection-head configuration does not match this run")
+    if checkpoint.get("pooling") != "mean":
+        raise ValueError("Checkpoint was not created with mean pooling")
+    student.load_state_dict(checkpoint["student"])
+    teacher.load_state_dict(checkpoint["teacher"])
+    objective.load_state_dict(checkpoint["objective"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scheduler.load_state_dict(checkpoint["scheduler"])
+    random.setstate(checkpoint["python_random_state"])
+    np.random.set_state(checkpoint["numpy_random_state"])
+    torch.set_rng_state(checkpoint["torch_random_state"].cpu())
+    if device.type == "cuda" and checkpoint["cuda_random_state"] is not None:
+        torch.cuda.set_rng_state(checkpoint["cuda_random_state"].cpu(), device)
+    return int(checkpoint["step"])
+
+
+def remove_old_periodic_checkpoints(output_dir: Path, keep_last: int) -> None:
+    checkpoints = sorted(
+        output_dir.glob("checkpoint-step-*.pt"),
+        key=lambda path: int(path.stem.rsplit("-", maxsplit=1)[1]),
+    )
+    for checkpoint in checkpoints[:-keep_last]:
+        checkpoint.unlink()
 
 
 def train(args: argparse.Namespace) -> Path:
     set_seed(args.seed)
     device = torch.device(args.device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    args.model_revision = resolve_model_revision(args.model_name, args.model_revision)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, revision=args.model_revision)
     student = SentenceDINO.from_pretrained(
         args.model_name,
+        revision=args.model_revision,
+        dropout=args.dropout,
         output_dim=args.output_dim,
         head_hidden_dim=args.head_hidden_dim,
         bottleneck_dim=args.bottleneck_dim,
@@ -129,10 +213,13 @@ def train(args: argparse.Namespace) -> Path:
     if any(parameter.requires_grad for parameter in teacher.parameters()):
         raise RuntimeError("Teacher parameters must not require gradients")
 
-    dataset = TextLineDataset(args.train_file)
+    train_dataset = TextLineDataset(args.train_file)
+    evaluation_dataset = (
+        load_stsb_split(args.stsb_dir, "validation") if args.eval_steps else None
+    )
     generator = torch.Generator().manual_seed(args.seed)
     loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=TokenizeCollator(tokenizer, args.max_length),
@@ -152,13 +239,29 @@ def train(args: argparse.Namespace) -> Path:
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
+    if args.save_steps < 0:
+        raise ValueError("save_steps must be non-negative")
+    if args.keep_last_checkpoints < 1:
+        raise ValueError("keep_last_checkpoints must be at least 1")
     global_step = 0
+    if args.resume_from_checkpoint:
+        global_step = restore_checkpoint(
+            args.resume_from_checkpoint, student, teacher, objective, optimizer, scheduler, device
+        )
+        if global_step >= total_steps:
+            raise ValueError("Checkpoint has already reached the requested total training steps")
+        print(f"Resumed from {args.resume_from_checkpoint} at step {global_step}", flush=True)
     dropout_warning_emitted = False
     collapse_warning_emitted = False
     student.train()
     optimizer.zero_grad(set_to_none=True)
-    for _epoch in range(args.epochs):
-        for batch in loader:
+    start_epoch = global_step // steps_per_epoch
+    resume_batch = global_step % steps_per_epoch
+    for epoch in range(start_epoch, args.epochs):
+        generator.manual_seed(args.seed + epoch)
+        for batch_index, batch in enumerate(loader):
+            if epoch == start_epoch and batch_index < resume_batch:
+                continue
             batch = {name: value.to(device) for name, value in batch.items()}
 
             student_view1 = student(**batch, use_dropout=True)
@@ -233,22 +336,37 @@ def train(args: argparse.Namespace) -> Path:
                     "pairwise_cosine": pairwise_cosine.item(),
                     **{name: value.item() for name, value in loss_metrics.items()},
                 }
-                print(json.dumps(log, sort_keys=True), flush=True)
+                log_metrics(args.output_dir, log)
 
             if args.eval_steps and global_step % args.eval_steps == 0:
                 metrics = evaluate_stsb(
                     teacher,
                     tokenizer,
+                    evaluation_dataset,
                     device=device,
-                    split="validation",
                     batch_size=args.eval_batch_size,
                     max_length=args.max_length,
                     limit=args.eval_limit,
                 )
-                print(json.dumps({"step": global_step, **metrics}, sort_keys=True), flush=True)
+                log_metrics(args.output_dir, {"step": global_step, **metrics})
                 teacher.eval()
                 student.train()
 
+            if args.save_steps and global_step % args.save_steps == 0:
+                periodic_path = save_checkpoint(
+                    Path(args.output_dir),
+                    student,
+                    teacher,
+                    objective,
+                    optimizer,
+                    scheduler,
+                    tokenizer,
+                    args,
+                    global_step,
+                    checkpoint_name=f"checkpoint-step-{global_step}.pt",
+                )
+                remove_old_periodic_checkpoints(Path(args.output_dir), args.keep_last_checkpoints)
+                print(f"Saved periodic checkpoint to {periodic_path}", flush=True)
             if global_step >= total_steps:
                 break
         if global_step >= total_steps:
@@ -273,7 +391,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train BERT-base with DINO and dropout views")
     parser.add_argument("--train-file", required=True, help="UTF-8 text, one sentence per line")
     parser.add_argument("--output-dir", default="runs/minimal-dino")
-    parser.add_argument("--model-name", default="bert-base-uncased")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
+    parser.add_argument(
+        "--model-revision",
+        help=(
+            "Immutable Hub commit; required for non-default remote models. "
+            f"The default BERT model uses {DEFAULT_MODEL_REVISION}."
+        ),
+    )
+    parser.add_argument("--resume-from-checkpoint")
+    parser.add_argument(
+        "--save-steps", type=int, default=500, help="0 disables periodic checkpoints"
+    )
+    parser.add_argument(
+        "--keep-last-checkpoints", type=int, default=2, help="Periodic checkpoints to retain"
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=0, help="0 uses all epoch steps")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -282,6 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="BERT hidden and attention dropout probability",
+    )
     parser.add_argument("--output-dim", type=int, default=65_536)
     parser.add_argument("--head-hidden-dim", type=int, default=2_048)
     parser.add_argument("--bottleneck-dim", type=int, default=256)
@@ -295,6 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-steps", type=int, default=250, help="0 disables STS evaluation")
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--eval-limit", type=int)
+    parser.add_argument("--stsb-dir", default="data/stsb")
     parser.add_argument("--collapse-warning-after", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)

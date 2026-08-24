@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -39,17 +40,44 @@ def test_dropout_views_are_independent_and_encode_is_deterministic():
     assert model.encoder.dropout.training is False
 
 
-def test_sentence_embedding_is_cls_before_projection_head():
+def test_sentence_embedding_is_masked_mean_before_projection_head():
     model = SentenceDINO(
         TinyEncoder(dropout=0.0), output_dim=16, head_hidden_dim=24, bottleneck_dim=8
     )
     batch = {
-        "input_ids": torch.tensor([[1, 2, 3]]),
-        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        "input_ids": torch.tensor([[1, 2, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 0]]),
     }
-    expected = model.encoder(**batch).last_hidden_state[:, 0]
+    hidden = model.encoder(**batch).last_hidden_state
+    expected = hidden[:, :2].mean(dim=1)
 
     output = model(**batch, use_dropout=False)
 
     assert torch.equal(output.embedding, expected)
     assert output.logits.shape == (1, 16)
+
+
+def test_from_pretrained_passes_revision_and_dropout(monkeypatch):
+    captured = {}
+
+    def fake_from_pretrained(model_name, **kwargs):
+        captured.update(model_name=model_name, **kwargs)
+        return TinyEncoder()
+
+    monkeypatch.setattr("minimal_dino.model.AutoModel.from_pretrained", fake_from_pretrained)
+
+    SentenceDINO.from_pretrained(
+        "example/model", revision="immutable-commit", dropout=0.2, output_dim=16
+    )
+
+    assert captured == {
+        "model_name": "example/model",
+        "revision": "immutable-commit",
+        "hidden_dropout_prob": 0.2,
+        "attention_probs_dropout_prob": 0.2,
+    }
+
+
+def test_from_pretrained_rejects_invalid_dropout():
+    with pytest.raises(ValueError, match="dropout must be"):
+        SentenceDINO.from_pretrained("example/model", dropout=1.0)

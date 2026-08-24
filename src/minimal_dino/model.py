@@ -68,7 +68,7 @@ class DINOOutput:
 
 
 class SentenceDINO(nn.Module):
-    """BERT [CLS] encoder followed by a DINO projection head."""
+    """Mean-pooled BERT encoder followed by a DINO projection head."""
 
     def __init__(
         self,
@@ -86,9 +86,23 @@ class SentenceDINO(nn.Module):
     def from_pretrained(
         cls,
         model_name: str = "bert-base-uncased",
+        *,
+        revision: str | None = None,
+        dropout: float | None = None,
         **head_kwargs: int,
     ) -> SentenceDINO:
-        return cls(AutoModel.from_pretrained(model_name), **head_kwargs)
+        model_kwargs = {}
+        if dropout is not None:
+            if not 0.0 <= dropout < 1.0:
+                raise ValueError("dropout must be in [0, 1)")
+            # BERT uses separate dropout probabilities for hidden states and attention.
+            # Keep them tied so one sweep value describes the complete encoder setup.
+            model_kwargs.update(
+                hidden_dropout_prob=dropout,
+                attention_probs_dropout_prob=dropout,
+            )
+        encoder = AutoModel.from_pretrained(model_name, revision=revision, **model_kwargs)
+        return cls(encoder, **head_kwargs)
 
     def forward(
         self,
@@ -105,9 +119,10 @@ class SentenceDINO(nn.Module):
                 attention_mask=attention_mask,
                 return_dict=True,
             ).last_hidden_state
-        embedding = hidden[:, 0]  # SimCSE's cls_before_pooler representation.
+        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+        embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         return DINOOutput(embedding=embedding, logits=self.head(embedding))
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Return the pre-projection [CLS] sentence representation without dropout."""
+        """Return the pre-projection masked-mean sentence representation without dropout."""
         return self(input_ids, attention_mask, use_dropout=False).embedding

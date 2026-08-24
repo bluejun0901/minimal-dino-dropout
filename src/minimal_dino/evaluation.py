@@ -16,6 +16,19 @@ from minimal_dino.data import TokenizeCollator
 from minimal_dino.model import SentenceDINO
 
 
+def load_stsb_split(data_dir: str | Path, split: str) -> Any:
+    """Load a previously downloaded STS-B Parquet split without accessing the Hub."""
+    path = Path(data_dir) / f"{split}.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"STS-B split not found at {path}. Download the pinned files described in README.md."
+        )
+
+    from datasets import Dataset
+
+    return Dataset.from_parquet(str(path))
+
+
 @torch.inference_mode()
 def encode_sentences(
     model: SentenceDINO,
@@ -68,16 +81,13 @@ def embedding_diagnostics(embeddings: torch.Tensor) -> dict[str, float]:
 def evaluate_stsb(
     model: SentenceDINO,
     tokenizer: Any,
+    dataset: Any,
     *,
     device: torch.device,
-    split: str = "validation",
     batch_size: int = 64,
     max_length: int = 32,
     limit: int | None = None,
 ) -> dict[str, float]:
-    from datasets import load_dataset
-
-    dataset = load_dataset("sentence-transformers/stsb", split=split)
     if limit is not None:
         dataset = dataset.select(range(min(limit, len(dataset))))
     sentence1 = list(dataset["sentence1"])
@@ -128,6 +138,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a minimal DINO checkpoint on STS-B")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", default="validation", choices=("validation", "test"))
+    parser.add_argument("--stsb-dir", default="data/stsb")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=32)
     parser.add_argument("--limit", type=int)
@@ -135,12 +146,13 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    dataset = load_stsb_split(args.stsb_dir, args.split)
     model, tokenizer = load_checkpoint(args.checkpoint, device)
     metrics = evaluate_stsb(
         model,
         tokenizer,
+        dataset,
         device=device,
-        split=args.split,
         batch_size=args.batch_size,
         max_length=args.max_length,
         limit=args.limit,

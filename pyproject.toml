@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "datasets>=2.19",
+    "matplotlib>=3.8",
     "scipy>=1.10",
     "torch==2.5.1",
     "transformers>=4.40,<6",
@@ -17,6 +18,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 [project.scripts]
 minimal-dino-train = "minimal_dino.train:main"
 minimal-dino-eval = "minimal_dino.evaluation:main"
+minimal-dino-plot = "minimal_dino.plot_metrics:main"
 
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu121"
