@@ -1,5 +1,6 @@
 import copy
 import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from minimal_dino.train import (
     resolve_model_revision,
     restore_checkpoint,
     save_checkpoint,
+    save_run_artifacts,
     update_teacher,
 )
 
@@ -164,3 +166,48 @@ def test_log_metrics_matches_stdout_and_appends_jsonl(tmp_path, capsys):
     file_lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
     assert file_lines == stdout_lines
     assert [json.loads(line) for line in file_lines] == [first, second]
+
+
+def test_save_run_artifacts_records_config_and_dirty_git_state(tmp_path, monkeypatch):
+    outputs = iter(
+        [
+            str(tmp_path) + "\n",
+            "0123456789abcdef0123456789abcdef01234567\n",
+            " M src/minimal_dino/train.py\n?? notes.txt\n",
+            "diff --git a/file b/file\n",
+        ]
+    )
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout=next(outputs), stderr="")
+
+    monkeypatch.setattr("minimal_dino.train.subprocess.run", fake_run)
+    args = SimpleNamespace(output_dir=str(tmp_path), seed=42, model_revision="abc")
+
+    save_run_artifacts(tmp_path, args)
+
+    assert json.loads((tmp_path / "config.json").read_text()) == vars(args)
+    git_state = json.loads((tmp_path / "git_state.json").read_text())
+    assert git_state == {
+        "available": True,
+        "commit_hash": "0123456789abcdef0123456789abcdef01234567",
+        "dirty": True,
+        "repository_root": str(tmp_path),
+        "status": " M src/minimal_dino/train.py\n?? notes.txt",
+        "diff_file": "git.diff",
+    }
+    assert (tmp_path / "git.diff").read_text() == "diff --git a/file b/file\n"
+
+
+def test_save_run_artifacts_survives_missing_git(tmp_path, monkeypatch):
+    def missing_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr("minimal_dino.train.subprocess.run", missing_git)
+
+    save_run_artifacts(tmp_path, SimpleNamespace(seed=7))
+
+    git_state = json.loads((tmp_path / "git_state.json").read_text())
+    assert git_state["available"] is False
+    assert "git" in git_state["error"]
+    assert (tmp_path / "git.diff").read_text() == ""

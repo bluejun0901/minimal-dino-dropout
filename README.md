@@ -1,17 +1,17 @@
-# Minimal DINO + dropout sentence embeddings
+# Minimal DINO sentence embeddings
 
-This repository is a deliberately narrow baseline:
+This repository is a deliberately narrow baseline with selectable view augmentation:
 
 ```text
 bert-base-uncased -> attention-mask-aware mean pooling
-    -> two independent standard-dropout views
+    -> two independent dropout or word-augmented views
     -> student / EMA teacher
     -> centered, sharpened two-view DINO cross-entropy
 ```
 
-There is no InfoNCE, token masking, textual augmentation, predictor, auxiliary loss, or
-multi-crop analogue. Sentence embeddings are mean-pooled last-layer token representations before
-the DINO head; padding tokens are excluded. Evaluation disables dropout and uses the EMA teacher.
+There is no InfoNCE, token masking, predictor, auxiliary loss, or multi-crop analogue. Sentence
+embeddings are mean-pooled last-layer token representations before the DINO head; padding tokens
+are excluded. Evaluation disables augmentation and uses the EMA teacher.
 
 ## 1. Create the environment
 
@@ -82,6 +82,23 @@ The default DINO head is `2048 -> 2048 -> 256 -> 65536`, with student temperatur
 teacher temperature 0.04, center momentum 0.9, and teacher EMA momentum cosine-scheduled from
 0.996 to 1. BERT hidden and attention dropout are both 0.1 and can be changed together with
 `--dropout`. The token ids and masks are identical in every view; only BERT dropout masks differ.
+
+The default `--augmentation dropout` preserves that behavior. To compare it with word-level
+augmentation, use for example:
+
+```bash
+uv run python -m minimal_dino.train \
+  --train-file data/wiki1m_for_simcse.txt \
+  --output-dir runs/dino-word-seed42 \
+  --augmentation word \
+  --augmentation-strength 0.1 \
+  --seed 42
+```
+
+In word mode, each word is selected independently with probability `--augmentation-strength`.
+Each selected word is then repeated once, deleted, or replaced by another word from its sentence,
+with the three operations chosen uniformly. Two views are generated before tokenization and BERT
+dropout is disabled. A strength of zero leaves the text unchanged.
 
 Every 500 steps, training atomically writes a full resumable checkpoint named
 `checkpoint-step-N.pt`. Only the newest two periodic checkpoints are retained, because each full

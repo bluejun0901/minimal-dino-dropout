@@ -6,6 +6,8 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
+from minimal_dino.augmentation import augment_words
+
 
 class TextLineDataset(Dataset[str]):
     """A plain text dataset with one non-empty sentence per line."""
@@ -40,3 +42,18 @@ class TokenizeCollator:
             return_tensors="pt",
         )
         return {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+
+
+class WordViewCollator:
+    """Create two independent word-augmented views, then tokenize them."""
+
+    def __init__(self, tokenizer: Any, max_length: int, strength: float) -> None:
+        self.tokenize = TokenizeCollator(tokenizer, max_length)
+        self.strength = strength
+
+    def __call__(
+        self, sentences: list[str]
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        view1 = [augment_words(sentence, self.strength) for sentence in sentences]
+        view2 = [augment_words(sentence, self.strength) for sentence in sentences]
+        return self.tokenize(view1), self.tokenize(view2)

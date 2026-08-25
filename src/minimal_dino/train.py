@@ -6,6 +6,7 @@ import json
 import math
 import random
 import re
+import subprocess
 import warnings
 from pathlib import Path
 from typing import Any
@@ -16,13 +17,77 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-from minimal_dino.data import TextLineDataset, TokenizeCollator
+from minimal_dino.data import TextLineDataset, TokenizeCollator, WordViewCollator
 from minimal_dino.evaluation import evaluate_stsb, load_stsb_split
 from minimal_dino.model import SentenceDINO
 from minimal_dino.objective import DINOLoss
 
 DEFAULT_MODEL_NAME = "bert-base-uncased"
 DEFAULT_MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"
+
+
+def _write_text_atomically(path: Path, content: str) -> None:
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(content, encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _run_git(arguments: list[str], cwd: Path) -> str:
+    result = subprocess.run(
+        ["git", *arguments],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return result.stdout
+
+
+def save_run_artifacts(
+    output_dir: str | Path,
+    args: argparse.Namespace,
+    git_cwd: str | Path | None = None,
+) -> None:
+    """Save the resolved arguments and source-tree state needed to reproduce a run."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    config = json.dumps(vars(args), indent=2, sort_keys=True, default=str) + "\n"
+
+    diff = ""
+    try:
+        repository_root = Path(
+            _run_git(["rev-parse", "--show-toplevel"], Path(git_cwd or Path.cwd())).strip()
+        )
+        commit_hash = _run_git(["rev-parse", "HEAD"], repository_root).strip()
+        status = _run_git(
+            ["status", "--short", "--untracked-files=all"], repository_root
+        ).rstrip()
+        # Comparing against HEAD includes both staged and unstaged tracked changes.
+        diff = _run_git(["diff", "--binary", "HEAD", "--"], repository_root)
+        git_state: dict[str, Any] = {
+            "available": True,
+            "commit_hash": commit_hash,
+            "dirty": bool(status),
+            "repository_root": str(repository_root),
+            "status": status,
+            "diff_file": "git.diff",
+        }
+    except (FileNotFoundError, subprocess.CalledProcessError) as error:
+        git_state = {
+            "available": False,
+            "error": str(error),
+            "diff_file": "git.diff",
+        }
+
+    # Capture Git before writing files so an unignored output directory does not dirty itself.
+    _write_text_atomically(output_path / "config.json", config)
+    _write_text_atomically(
+        output_path / "git_state.json",
+        json.dumps(git_state, indent=2, sort_keys=True) + "\n",
+    )
+    _write_text_atomically(output_path / "git.diff", diff)
 
 
 def log_metrics(output_dir: str | Path, metrics: dict[str, float | int]) -> None:
@@ -193,8 +258,11 @@ def remove_old_periodic_checkpoints(output_dir: Path, keep_last: int) -> None:
 
 def train(args: argparse.Namespace) -> Path:
     set_seed(args.seed)
+    if not 0.0 <= args.augmentation_strength <= 1.0:
+        raise ValueError("augmentation_strength must be in [0, 1]")
     device = torch.device(args.device)
     args.model_revision = resolve_model_revision(args.model_name, args.model_revision)
+    save_run_artifacts(args.output_dir, args)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, revision=args.model_revision)
     student = SentenceDINO.from_pretrained(
         args.model_name,
@@ -218,11 +286,16 @@ def train(args: argparse.Namespace) -> Path:
         load_stsb_split(args.stsb_dir, "validation") if args.eval_steps else None
     )
     generator = torch.Generator().manual_seed(args.seed)
+    collator = (
+        TokenizeCollator(tokenizer, args.max_length)
+        if args.augmentation == "dropout"
+        else WordViewCollator(tokenizer, args.max_length, args.augmentation_strength)
+    )
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=TokenizeCollator(tokenizer, args.max_length),
+        collate_fn=collator,
         num_workers=args.num_workers,
         generator=generator,
         drop_last=False,
@@ -258,17 +331,29 @@ def train(args: argparse.Namespace) -> Path:
     start_epoch = global_step // steps_per_epoch
     resume_batch = global_step % steps_per_epoch
     for epoch in range(start_epoch, args.epochs):
+        if args.augmentation == "word":
+            # Replaying skipped batches after resume reproduces the same augmented views.
+            random.seed(args.seed + epoch)
         generator.manual_seed(args.seed + epoch)
         for batch_index, batch in enumerate(loader):
             if epoch == start_epoch and batch_index < resume_batch:
                 continue
-            batch = {name: value.to(device) for name, value in batch.items()}
-
-            student_view1 = student(**batch, use_dropout=True)
-            student_view2 = student(**batch, use_dropout=True)
-            with torch.no_grad():
-                teacher_view1 = teacher(**batch, use_dropout=True)
-                teacher_view2 = teacher(**batch, use_dropout=True)
+            if args.augmentation == "dropout":
+                batch = {name: value.to(device) for name, value in batch.items()}
+                student_view1 = student(**batch, use_dropout=True)
+                student_view2 = student(**batch, use_dropout=True)
+                with torch.no_grad():
+                    teacher_view1 = teacher(**batch, use_dropout=True)
+                    teacher_view2 = teacher(**batch, use_dropout=True)
+            else:
+                view1, view2 = (
+                    {name: value.to(device) for name, value in view.items()} for view in batch
+                )
+                student_view1 = student(**view1, use_dropout=False)
+                student_view2 = student(**view2, use_dropout=False)
+                with torch.no_grad():
+                    teacher_view1 = teacher(**view1, use_dropout=False)
+                    teacher_view2 = teacher(**view2, use_dropout=False)
 
             temperature = teacher_temperature(
                 global_step,
@@ -302,7 +387,7 @@ def train(args: argparse.Namespace) -> Path:
             pairwise_cosine = off_diagonal_cosine(student_view1.embedding.detach())
             embedding_std = student_view1.embedding.detach().std(dim=0, unbiased=False).mean()
 
-            if not dropout_warning_emitted and (
+            if args.augmentation == "dropout" and not dropout_warning_emitted and (
                 torch.equal(student_view1.embedding, student_view2.embedding)
                 or torch.equal(teacher_view1.embedding, teacher_view2.embedding)
             ):
@@ -388,7 +473,7 @@ def train(args: argparse.Namespace) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train BERT-base with DINO and dropout views")
+    parser = argparse.ArgumentParser(description="Train BERT-base with DINO text views")
     parser.add_argument("--train-file", required=True, help="UTF-8 text, one sentence per line")
     parser.add_argument("--output-dir", default="runs/minimal-dino")
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
@@ -419,6 +504,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="BERT hidden and attention dropout probability",
+    )
+    parser.add_argument(
+        "--augmentation",
+        choices=("dropout", "word"),
+        default="dropout",
+        help="View augmentation method (default: dropout)",
+    )
+    parser.add_argument(
+        "--augmentation-strength",
+        type=float,
+        default=0.1,
+        help="Per-word augmentation probability in word mode",
     )
     parser.add_argument("--output-dim", type=int, default=65_536)
     parser.add_argument("--head-hidden-dim", type=int, default=2_048)
