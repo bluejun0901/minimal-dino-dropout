@@ -92,7 +92,10 @@ and tokenizer.
 Training logs JSON diagnostics for loss, gradient norm, dropout-view cosine, center norm,
 teacher/student entropy, embedding standard deviation, and cross-sentence cosine.
 Every JSON record printed to stdout is also appended immediately to `metrics.jsonl` in the run
-directory. Resumed runs append to the existing file.
+directory. STS-B validation runs at step 0 and then at every `--eval-steps` interval. Each
+evaluation also reports embedding uniformity and the Spearman correlation between the current and
+initial BERT pairwise cosine-similarity values. Resumed runs append to the existing file without
+duplicating the step-0 record.
 
 ## 4. Resume an interrupted run
 
@@ -135,8 +138,10 @@ uv run python -m minimal_dino.evaluation \
 ```
 
 This reads the previously downloaded STS-B split from `data/stsb`; evaluation performs no dataset
-Hub calls. It then reports Spearman/Pearson correlations and collapse diagnostics from
-deterministic mean-pooled EMA-teacher embeddings. Pass `--stsb-dir` if the files are elsewhere.
+Hub calls. It then reports Spearman/Pearson correlations, collapse diagnostics, and uniformity from
+deterministic mean-pooled EMA-teacher embeddings. During training, evaluation additionally reports
+pairwise-cosine Spearman correlation relative to cached step-0 BERT embeddings. Pass `--stsb-dir`
+if the files are elsewhere.
 
 ## 6. Plot training metrics
 

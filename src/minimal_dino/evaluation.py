@@ -53,7 +53,10 @@ def encode_sentences(
     return torch.cat(embeddings)
 
 
-def embedding_diagnostics(embeddings: torch.Tensor) -> dict[str, float]:
+def embedding_diagnostics(
+    embeddings: torch.Tensor,
+    initial_embeddings: torch.Tensor | None = None,
+) -> dict[str, float]:
     """Cheap collapse indicators on deterministic, pre-head sentence embeddings."""
     normalized = F.normalize(embeddings.float(), dim=-1)
     n = normalized.shape[0]
@@ -63,22 +66,45 @@ def embedding_diagnostics(embeddings: torch.Tensor) -> dict[str, float]:
         distinct = similarities[indices[0], indices[1]]
         pairwise_mean = distinct.mean().item()
         pairwise_std = distinct.std(unbiased=False).item()
+        squared_distances = torch.pdist(normalized, p=2).square()
+        uniformity = torch.exp(-2.0 * squared_distances).mean().log().item()
     else:
         pairwise_mean = float("nan")
         pairwise_std = float("nan")
+        uniformity = float("nan")
 
     singular_values = torch.linalg.svdvals(embeddings.float() - embeddings.float().mean(0))
     probabilities = singular_values / singular_values.sum().clamp_min(1e-12)
     effective_rank = torch.exp(-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).item()
-    return {
+    metrics = {
         "embedding_std": embeddings.float().std(dim=0, unbiased=False).mean().item(),
         "pairwise_cosine_mean": pairwise_mean,
         "pairwise_cosine_std": pairwise_std,
+        "uniformity": uniformity,
         "effective_rank": effective_rank,
     }
+    if initial_embeddings is not None:
+        if initial_embeddings.shape != embeddings.shape:
+            raise ValueError(
+                "Initial and current embeddings must have the same shape, got "
+                f"{tuple(initial_embeddings.shape)} and {tuple(embeddings.shape)}"
+            )
+        if n > 1:
+            initial_normalized = F.normalize(initial_embeddings.float(), dim=-1)
+            initial_similarities = initial_normalized @ initial_normalized.T
+            initial_distinct = initial_similarities[indices[0], indices[1]]
+            metrics["initial_pairwise_cosine_spearman"] = float(
+                spearmanr(
+                    distinct.detach().cpu().numpy(),
+                    initial_distinct.detach().cpu().numpy(),
+                ).statistic
+            )
+        else:
+            metrics["initial_pairwise_cosine_spearman"] = float("nan")
+    return metrics
 
 
-def evaluate_stsb(
+def encode_stsb_dataset(
     model: SentenceDINO,
     tokenizer: Any,
     dataset: Any,
@@ -87,7 +113,7 @@ def evaluate_stsb(
     batch_size: int = 64,
     max_length: int = 32,
     limit: int | None = None,
-) -> dict[str, float]:
+) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
     if limit is not None:
         dataset = dataset.select(range(min(limit, len(dataset))))
     sentence1 = list(dataset["sentence1"])
@@ -111,13 +137,56 @@ def evaluate_stsb(
         batch_size=batch_size,
         max_length=max_length,
     )
+    return embedding1, embedding2, scores
+
+
+def stsb_metrics(
+    embedding1: torch.Tensor,
+    embedding2: torch.Tensor,
+    scores: np.ndarray,
+    *,
+    initial_embeddings: torch.Tensor | None = None,
+) -> dict[str, float]:
     similarities = F.cosine_similarity(embedding1, embedding2).numpy()
     metrics = {
         "sts_spearman": float(spearmanr(similarities, scores).statistic),
         "sts_pearson": float(pearsonr(similarities, scores).statistic),
     }
-    metrics.update(embedding_diagnostics(torch.cat((embedding1, embedding2))))
+    metrics.update(
+        embedding_diagnostics(
+            torch.cat((embedding1, embedding2)),
+            initial_embeddings=initial_embeddings,
+        )
+    )
     return metrics
+
+
+def evaluate_stsb(
+    model: SentenceDINO,
+    tokenizer: Any,
+    dataset: Any,
+    *,
+    device: torch.device,
+    batch_size: int = 64,
+    max_length: int = 32,
+    limit: int | None = None,
+    initial_embeddings: torch.Tensor | None = None,
+) -> dict[str, float]:
+    embedding1, embedding2, scores = encode_stsb_dataset(
+        model,
+        tokenizer,
+        dataset,
+        device=device,
+        batch_size=batch_size,
+        max_length=max_length,
+        limit=limit,
+    )
+    return stsb_metrics(
+        embedding1,
+        embedding2,
+        scores,
+        initial_embeddings=initial_embeddings,
+    )
 
 
 def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceDINO, Any]:
