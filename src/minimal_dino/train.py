@@ -383,8 +383,8 @@ def train(args: argparse.Namespace) -> Path:
                 student_view1 = student(**batch, use_dropout=True)
                 student_view2 = student(**batch, use_dropout=True)
                 with torch.no_grad():
-                    teacher_view1 = teacher(**batch, use_dropout=True)
-                    teacher_view2 = teacher(**batch, use_dropout=True)
+                    teacher_view1 = teacher(**batch, use_dropout=False)
+                    teacher_view2 = teacher(**batch, use_dropout=False)
             else:
                 view1, view2 = (
                     {name: value.to(device) for name, value in view.items()} for view in batch

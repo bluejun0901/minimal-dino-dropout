@@ -22,12 +22,12 @@ fi
 
 # Edit these grids to change the sweep. Each run changes only the named value;
 # all other hyperparameters remain at the current baseline below.
-DROPOUT_VALUES=(0.0 0.05 0.1 0.2 0.3)
+DROPOUT_VALUES=(0.05 0.1 0.2 0.3)
 CENTER_MOMENTUM_VALUES=(0.5 0.9 0.99 0.999)
 TEACHER_MOMENTUM_VALUES=(0.9 0.99 0.996 0.999)
 
 TRAIN_FILE="${TRAIN_FILE:-data/wiki1m_for_simcse.txt}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs/sweeps}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-runs/sweeps-v2}"
 DEVICE="${DEVICE:-cuda}"
 
 if [[ ! -f "${TRAIN_FILE}" ]]; then
