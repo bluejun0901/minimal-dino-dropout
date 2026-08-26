@@ -18,7 +18,11 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from minimal_dino.data import TextLineDataset, TokenizeCollator, WordViewCollator
-from minimal_dino.evaluation import evaluate_stsb, load_stsb_split
+from minimal_dino.evaluation import (
+    encode_stsb_dataset,
+    load_stsb_split,
+    stsb_metrics,
+)
 from minimal_dino.model import SentenceDINO
 from minimal_dino.objective import DINOLoss, InfoNCELoss, build_objective
 
@@ -353,6 +357,27 @@ def train(args: argparse.Namespace) -> Path:
         raise ValueError("save_steps must be non-negative")
     if args.keep_last_checkpoints < 1:
         raise ValueError("keep_last_checkpoints must be at least 1")
+
+    initial_eval_embeddings = None
+    initial_eval_metrics = None
+    if evaluation_dataset is not None:
+        initial_embedding1, initial_embedding2, evaluation_scores = encode_stsb_dataset(
+            teacher,
+            tokenizer,
+            evaluation_dataset,
+            device=device,
+            batch_size=args.eval_batch_size,
+            max_length=args.max_length,
+            limit=args.eval_limit,
+        )
+        initial_eval_embeddings = torch.cat((initial_embedding1, initial_embedding2))
+        initial_eval_metrics = stsb_metrics(
+            initial_embedding1,
+            initial_embedding2,
+            evaluation_scores,
+            initial_embeddings=initial_eval_embeddings,
+        )
+
     global_step = 0
     if args.resume_from_checkpoint:
         global_step = restore_checkpoint(
@@ -364,6 +389,12 @@ def train(args: argparse.Namespace) -> Path:
             _print_progress(global_step, total_steps)
         else:
             print(f"Resumed from {args.resume_from_checkpoint} at step {global_step}", flush=True)
+    elif initial_eval_metrics is not None:
+        log_metrics(
+            args.output_dir,
+            {"step": 0, **initial_eval_metrics},
+            quiet=args.quiet,
+        )
     dropout_warning_emitted = False
     collapse_warning_emitted = False
     student.train()
@@ -472,7 +503,9 @@ def train(args: argparse.Namespace) -> Path:
                 log_metrics(args.output_dir, log, quiet=args.quiet)
 
             if args.eval_steps and global_step % args.eval_steps == 0:
-                metrics = evaluate_stsb(
+                if evaluation_dataset is None or initial_eval_embeddings is None:
+                    raise RuntimeError("Evaluation data was not initialized")
+                embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
                     teacher,
                     tokenizer,
                     evaluation_dataset,
@@ -480,6 +513,12 @@ def train(args: argparse.Namespace) -> Path:
                     batch_size=args.eval_batch_size,
                     max_length=args.max_length,
                     limit=args.eval_limit,
+                )
+                metrics = stsb_metrics(
+                    embedding1,
+                    embedding2,
+                    evaluation_scores,
+                    initial_embeddings=initial_eval_embeddings,
                 )
                 log_metrics(
                     args.output_dir,
