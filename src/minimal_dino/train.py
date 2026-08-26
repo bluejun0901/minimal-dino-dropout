@@ -20,7 +20,7 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from minimal_dino.data import TextLineDataset, TokenizeCollator, WordViewCollator
 from minimal_dino.evaluation import evaluate_stsb, load_stsb_split
 from minimal_dino.model import SentenceDINO
-from minimal_dino.objective import DINOLoss
+from minimal_dino.objective import DINOLoss, InfoNCELoss, build_objective
 
 DEFAULT_MODEL_NAME = "bert-base-uncased"
 DEFAULT_MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"
@@ -90,15 +90,31 @@ def save_run_artifacts(
     _write_text_atomically(output_path / "git.diff", diff)
 
 
-def log_metrics(output_dir: str | Path, metrics: dict[str, float | int]) -> None:
+def log_metrics(
+    output_dir: str | Path,
+    metrics: dict[str, float | int],
+    *,
+    quiet: bool = False,
+) -> None:
     """Emit one metrics record to stdout and the run's append-only JSONL file."""
     line = json.dumps(metrics, sort_keys=True)
-    print(line, flush=True)
+    if not quiet:
+        print(line, flush=True)
     path = Path(output_dir) / "metrics.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(line + "\n")
         stream.flush()
+
+
+def _print_progress(step: int, total_steps: int, width: int = 30) -> None:
+    filled = int(width * step / total_steps)
+    bar = "#" * filled + "-" * (width - filled)
+    print(
+        f"\rTraining [{bar}] {step}/{total_steps}",
+        end="\n" if step >= total_steps else "",
+        flush=True,
+    )
 
 
 def resolve_model_revision(model_name: str, revision: str | None) -> str | None:
@@ -171,7 +187,7 @@ def save_checkpoint(
     output_dir: Path,
     student: SentenceDINO,
     teacher: SentenceDINO,
-    objective: DINOLoss,
+    objective: DINOLoss | InfoNCELoss,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     tokenizer: Any,
@@ -192,6 +208,7 @@ def save_checkpoint(
         {
             "student": student.state_dict(),
             "teacher": teacher.state_dict(),
+            "objective_name": getattr(args, "objective", "dino"),
             "objective": objective.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -219,12 +236,18 @@ def restore_checkpoint(
     checkpoint_path: str | Path,
     student: SentenceDINO,
     teacher: SentenceDINO,
-    objective: DINOLoss,
+    objective: DINOLoss | InfoNCELoss,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     device: torch.device,
 ) -> int:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint_objective = checkpoint.get("objective_name", "dino")
+    if checkpoint_objective != objective_name(objective):
+        raise ValueError(
+            f"Checkpoint objective is {checkpoint_objective}, but this run uses "
+            f"{objective_name(objective)}"
+        )
     expected_head_config = {
         "output_dim": student.head.last_weight.shape[0],
         "head_hidden_dim": student.head.mlp[0].out_features,
@@ -245,6 +268,14 @@ def restore_checkpoint(
     if device.type == "cuda" and checkpoint["cuda_random_state"] is not None:
         torch.cuda.set_rng_state(checkpoint["cuda_random_state"].cpu(), device)
     return int(checkpoint["step"])
+
+
+def objective_name(objective: DINOLoss | InfoNCELoss) -> str:
+    if isinstance(objective, DINOLoss):
+        return "dino"
+    if isinstance(objective, InfoNCELoss):
+        return "infonce"
+    raise TypeError(f"Unsupported objective type: {type(objective).__name__}")
 
 
 def remove_old_periodic_checkpoints(output_dir: Path, keep_last: int) -> None:
@@ -274,7 +305,13 @@ def train(args: argparse.Namespace) -> Path:
     ).to(device)
     teacher = copy.deepcopy(student).to(device).eval()
     teacher.requires_grad_(False)
-    objective = DINOLoss(args.output_dim, args.student_temp, args.center_momentum).to(device)
+    objective = build_objective(
+        args.objective,
+        output_dim=args.output_dim,
+        student_temp=args.student_temp,
+        center_momentum=args.center_momentum,
+        infonce_temp=args.infonce_temp,
+    ).to(device)
 
     if not all(torch.equal(a, b) for a, b in zip(student.parameters(), teacher.parameters())):
         raise RuntimeError("Teacher was not initialized exactly from the student")
@@ -323,7 +360,10 @@ def train(args: argparse.Namespace) -> Path:
         )
         if global_step >= total_steps:
             raise ValueError("Checkpoint has already reached the requested total training steps")
-        print(f"Resumed from {args.resume_from_checkpoint} at step {global_step}", flush=True)
+        if args.quiet:
+            _print_progress(global_step, total_steps)
+        else:
+            print(f"Resumed from {args.resume_from_checkpoint} at step {global_step}", flush=True)
     dropout_warning_emitted = False
     collapse_warning_emitted = False
     student.train()
@@ -361,11 +401,16 @@ def train(args: argparse.Namespace) -> Path:
                 args.warmup_teacher_temp,
                 args.teacher_temp,
             )
-            loss, loss_metrics = objective(
-                (student_view1.logits, student_view2.logits),
-                (teacher_view1.logits, teacher_view2.logits),
-                temperature,
-            )
+            if isinstance(objective, DINOLoss):
+                loss, loss_metrics = objective(
+                    (student_view1.logits, student_view2.logits),
+                    (teacher_view1.logits, teacher_view2.logits),
+                    temperature,
+                )
+            else:
+                loss, loss_metrics = objective(
+                    (student_view1.embedding, student_view2.embedding)
+                )
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {loss.item()}")
             loss.backward()
@@ -375,7 +420,8 @@ def train(args: argparse.Namespace) -> Path:
 
             momentum = cosine_teacher_momentum(global_step, total_steps, args.teacher_momentum)
             update_teacher(student, teacher, momentum)
-            objective.update_center((teacher_view1.logits, teacher_view2.logits))
+            if isinstance(objective, DINOLoss):
+                objective.update_center((teacher_view1.logits, teacher_view2.logits))
             optimizer.zero_grad(set_to_none=True)
 
             student_view_cosine = F.cosine_similarity(
@@ -407,6 +453,8 @@ def train(args: argparse.Namespace) -> Path:
                 collapse_warning_emitted = True
 
             global_step += 1
+            if args.quiet:
+                _print_progress(global_step, total_steps)
             if global_step == 1 or global_step % args.log_steps == 0:
                 log = {
                     "step": global_step,
@@ -421,7 +469,7 @@ def train(args: argparse.Namespace) -> Path:
                     "pairwise_cosine": pairwise_cosine.item(),
                     **{name: value.item() for name, value in loss_metrics.items()},
                 }
-                log_metrics(args.output_dir, log)
+                log_metrics(args.output_dir, log, quiet=args.quiet)
 
             if args.eval_steps and global_step % args.eval_steps == 0:
                 metrics = evaluate_stsb(
@@ -433,7 +481,11 @@ def train(args: argparse.Namespace) -> Path:
                     max_length=args.max_length,
                     limit=args.eval_limit,
                 )
-                log_metrics(args.output_dir, {"step": global_step, **metrics})
+                log_metrics(
+                    args.output_dir,
+                    {"step": global_step, **metrics},
+                    quiet=args.quiet,
+                )
                 teacher.eval()
                 student.train()
 
@@ -451,7 +503,8 @@ def train(args: argparse.Namespace) -> Path:
                     checkpoint_name=f"checkpoint-step-{global_step}.pt",
                 )
                 remove_old_periodic_checkpoints(Path(args.output_dir), args.keep_last_checkpoints)
-                print(f"Saved periodic checkpoint to {periodic_path}", flush=True)
+                if not args.quiet:
+                    print(f"Saved periodic checkpoint to {periodic_path}", flush=True)
             if global_step >= total_steps:
                 break
         if global_step >= total_steps:
@@ -473,7 +526,7 @@ def train(args: argparse.Namespace) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train BERT-base with DINO text views")
+    parser = argparse.ArgumentParser(description="Train BERT-base with self-supervised text views")
     parser.add_argument("--train-file", required=True, help="UTF-8 text, one sentence per line")
     parser.add_argument("--output-dir", default="runs/minimal-dino")
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
@@ -517,16 +570,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="Per-word augmentation probability in word mode",
     )
+    parser.add_argument(
+        "--objective",
+        choices=("dino", "infonce"),
+        default="dino",
+        help="Self-supervised training objective (default: dino)",
+    )
     parser.add_argument("--output-dim", type=int, default=65_536)
     parser.add_argument("--head-hidden-dim", type=int, default=2_048)
     parser.add_argument("--bottleneck-dim", type=int, default=256)
     parser.add_argument("--student-temp", type=float, default=0.1)
+    parser.add_argument("--infonce-temp", type=float, default=0.05)
     parser.add_argument("--teacher-temp", type=float, default=0.04)
     parser.add_argument("--warmup-teacher-temp", type=float, default=0.04)
     parser.add_argument("--teacher-temp-warmup-steps", type=int, default=0)
     parser.add_argument("--teacher-momentum", type=float, default=0.996)
     parser.add_argument("--center-momentum", type=float, default=0.9)
     parser.add_argument("--log-steps", type=int, default=10)
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Show only a compact training progress bar",
+    )
     parser.add_argument("--eval-steps", type=int, default=250, help="0 disables STS evaluation")
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--eval-limit", type=int)
@@ -541,7 +606,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     checkpoint = train(args)
-    print(f"Saved checkpoint to {checkpoint}")
+    if not args.quiet:
+        print(f"Saved checkpoint to {checkpoint}")
 
 
 if __name__ == "__main__":

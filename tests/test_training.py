@@ -11,6 +11,8 @@ from minimal_dino.model import SentenceDINO
 from minimal_dino.objective import DINOLoss
 from minimal_dino.train import (
     DEFAULT_MODEL_REVISION,
+    _print_progress,
+    build_parser,
     cosine_teacher_momentum,
     log_metrics,
     remove_old_periodic_checkpoints,
@@ -168,6 +170,21 @@ def test_log_metrics_matches_stdout_and_appends_jsonl(tmp_path, capsys):
     assert [json.loads(line) for line in file_lines] == [first, second]
 
 
+def test_quiet_metrics_only_write_jsonl(tmp_path, capsys):
+    metrics = {"step": 1, "loss": 2.0}
+
+    log_metrics(tmp_path, metrics, quiet=True)
+
+    assert capsys.readouterr().out == ""
+    assert json.loads((tmp_path / "metrics.jsonl").read_text()) == metrics
+
+
+def test_progress_bar_finishes_with_newline(capsys):
+    _print_progress(2, 2, width=4)
+
+    assert capsys.readouterr().out == "\rTraining [####] 2/2\n"
+
+
 def test_save_run_artifacts_records_config_and_dirty_git_state(tmp_path, monkeypatch):
     outputs = iter(
         [
@@ -211,3 +228,20 @@ def test_save_run_artifacts_survives_missing_git(tmp_path, monkeypatch):
     assert git_state["available"] is False
     assert "git" in git_state["error"]
     assert (tmp_path / "git.diff").read_text() == ""
+
+
+def test_cli_defaults_to_dino_and_can_select_infonce():
+    parser = build_parser()
+
+    default_args = parser.parse_args(["--train-file", "train.txt"])
+    infonce_args = parser.parse_args(
+        ["--train-file", "train.txt", "--objective", "infonce", "--infonce-temp", "0.2"]
+    )
+
+    assert default_args.objective == "dino"
+    assert default_args.quiet is False
+    assert infonce_args.objective == "infonce"
+    assert infonce_args.infonce_temp == 0.2
+
+    quiet_args = parser.parse_args(["--train-file", "train.txt", "--quiet"])
+    assert quiet_args.quiet is True

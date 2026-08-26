@@ -1,7 +1,7 @@
 import torch
 from torch.nn import functional as F
 
-from minimal_dino.objective import DINOLoss
+from minimal_dino.objective import DINOLoss, InfoNCELoss, build_objective
 
 
 def test_dino_loss_uses_only_opposite_views_and_stops_teacher_gradient():
@@ -37,3 +37,36 @@ def test_center_uses_raw_teacher_logits_after_loss():
 
     assert metrics_before["center_norm"].item() == 0.0
     assert torch.equal(objective.center, torch.tensor([[0.5, 0.5]]))
+
+
+def test_infonce_uses_diagonal_pairs_in_both_directions():
+    objective = InfoNCELoss(temperature=0.2)
+    view1 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)
+    view2 = torch.tensor([[0.8, 0.2], [0.1, 0.9]], requires_grad=True)
+
+    loss, metrics = objective((view1, view2))
+    logits = F.normalize(view1, dim=-1) @ F.normalize(view2, dim=-1).T / 0.2
+    labels = torch.arange(2)
+    expected = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+    loss.backward()
+
+    assert torch.allclose(loss, expected)
+    assert view1.grad is not None
+    assert view2.grad is not None
+    assert metrics["positive_cosine"] > metrics["negative_cosine"]
+    assert metrics["contrastive_accuracy"] == 1
+
+
+def test_objective_factory_defaults_to_distinct_representation_paths():
+    dino = build_objective(
+        "dino", output_dim=3, student_temp=0.1, center_momentum=0.9, infonce_temp=0.05
+    )
+    infonce = build_objective(
+        "infonce", output_dim=3, student_temp=0.1, center_momentum=0.9, infonce_temp=0.2
+    )
+
+    assert isinstance(dino, DINOLoss)
+    assert dino.representation == "logits"
+    assert isinstance(infonce, InfoNCELoss)
+    assert infonce.representation == "embedding"
+    assert infonce.temperature == 0.2

@@ -1,17 +1,18 @@
-# Minimal DINO sentence embeddings
+# Minimal DINO / InfoNCE sentence embeddings
 
-This repository is a deliberately narrow baseline with selectable view augmentation:
+This repository is a deliberately narrow baseline with independently selectable objectives and
+view augmentation:
 
 ```text
 bert-base-uncased -> attention-mask-aware mean pooling
     -> two independent dropout or word-augmented views
-    -> student / EMA teacher
-    -> centered, sharpened two-view DINO cross-entropy
+    -> DINO: student / EMA teacher -> centered, sharpened cross-entropy
+    -> InfoNCE: student view 1 / student view 2 -> symmetric in-batch contrastive loss
 ```
 
-There is no InfoNCE, token masking, predictor, auxiliary loss, or multi-crop analogue. Sentence
-embeddings are mean-pooled last-layer token representations before the DINO head; padding tokens
-are excluded. Evaluation disables augmentation and uses the EMA teacher.
+There is no token masking, predictor, auxiliary loss, or multi-crop analogue. Sentence embeddings
+are mean-pooled last-layer token representations before the DINO head; padding tokens are excluded.
+Evaluation disables augmentation and uses the EMA teacher.
 
 ## 1. Create the environment
 
@@ -100,6 +101,23 @@ Each selected word is then repeated once, deleted, or replaced by another word f
 with the three operations chosen uniformly. Two views are generated before tokenization and BERT
 dropout is disabled. A strength of zero leaves the text unchanged.
 
+The default `--objective dino` preserves the original training behavior. To switch only the
+objective to InfoNCE, use:
+
+```bash
+uv run python -m minimal_dino.train \
+  --train-file data/wiki1m_for_simcse.txt \
+  --output-dir runs/infonce-dropout-seed42 \
+  --objective infonce \
+  --infonce-temp 0.05 \
+  --seed 42
+```
+
+InfoNCE uses the mean-pooled embeddings directly. Each example's two augmented views form the
+positive pair, all other examples in the batch are negatives, and the two view directions are
+averaged. The EMA teacher is still maintained and used for evaluation so that changing
+`--objective` does not silently change the rest of the training and evaluation pipeline.
+
 Every 500 steps, training atomically writes a full resumable checkpoint named
 `checkpoint-step-N.pt`. Only the newest two periodic checkpoints are retained, because each full
 BERT student/teacher checkpoint is large. At successful completion, `checkpoint.pt` is also
@@ -110,6 +128,7 @@ Training logs JSON diagnostics for loss, gradient norm, dropout-view cosine, cen
 teacher/student entropy, embedding standard deviation, and cross-sentence cosine.
 Every JSON record printed to stdout is also appended immediately to `metrics.jsonl` in the run
 directory. Resumed runs append to the existing file.
+Pass `--quiet` to show only a compact training progress bar while keeping the JSONL log unchanged.
 
 ## 4. Resume an interrupted run
 

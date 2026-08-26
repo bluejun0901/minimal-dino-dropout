@@ -8,6 +8,9 @@ from torch.nn import functional as F
 class DINOLoss(nn.Module):
     """Two-view DINO cross-entropy with teacher centering and sharpening."""
 
+    representation = "logits"
+    uses_teacher = True
+
     def __init__(self, output_dim: int, student_temp: float = 0.1, center_momentum: float = 0.9):
         super().__init__()
         if student_temp <= 0:
@@ -62,3 +65,59 @@ class DINOLoss(nn.Module):
         # Update after computing the loss, so the current batch uses the previous center.
         batch_center = torch.cat(teacher_views).mean(dim=0, keepdim=True)
         self.center.mul_(self.center_momentum).add_(batch_center, alpha=1 - self.center_momentum)
+
+
+class InfoNCELoss(nn.Module):
+    """Symmetric in-batch InfoNCE over two augmented sentence views."""
+
+    representation = "embedding"
+    uses_teacher = False
+
+    def __init__(self, temperature: float = 0.05) -> None:
+        super().__init__()
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        self.temperature = temperature
+
+    def forward(
+        self, views: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        view1, view2 = (F.normalize(view, dim=-1) for view in views)
+        logits = view1 @ view2.T / self.temperature
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+
+        similarities = logits.detach() * self.temperature
+        positive_cosine = similarities.diagonal().mean()
+        if similarities.shape[0] > 1:
+            negative_mask = ~torch.eye(
+                similarities.shape[0], dtype=torch.bool, device=similarities.device
+            )
+            negative_cosine = similarities[negative_mask].mean()
+        else:
+            negative_cosine = similarities.new_tensor(float("nan"))
+        accuracy = (
+            (logits.argmax(dim=1) == labels).float().mean()
+            + (logits.argmax(dim=0) == labels).float().mean()
+        ) / 2
+        return loss, {
+            "positive_cosine": positive_cosine,
+            "negative_cosine": negative_cosine,
+            "contrastive_accuracy": accuracy,
+        }
+
+
+def build_objective(
+    name: str,
+    *,
+    output_dim: int,
+    student_temp: float,
+    center_momentum: float,
+    infonce_temp: float,
+) -> DINOLoss | InfoNCELoss:
+    """Construct an objective while keeping objective-specific settings local."""
+    if name == "dino":
+        return DINOLoss(output_dim, student_temp, center_momentum)
+    if name == "infonce":
+        return InfoNCELoss(infonce_temp)
+    raise ValueError(f"Unknown objective: {name}")
