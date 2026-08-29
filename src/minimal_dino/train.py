@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import json
 import math
@@ -9,14 +8,18 @@ import re
 import subprocess
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import hydra
 import numpy as np
 import torch
+from omegaconf import DictConfig
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
+from minimal_dino.config import config_to_container, to_train_args
 from minimal_dino.data import TextLineDataset, TokenizeCollator, WordViewCollator
 from minimal_dino.evaluation import (
     encode_stsb_dataset,
@@ -51,13 +54,13 @@ def _run_git(arguments: list[str], cwd: Path) -> str:
 
 def save_run_artifacts(
     output_dir: str | Path,
-    args: argparse.Namespace,
+    args: SimpleNamespace,
     git_cwd: str | Path | None = None,
 ) -> None:
     """Save the resolved arguments and source-tree state needed to reproduce a run."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    config = json.dumps(vars(args), indent=2, sort_keys=True, default=str) + "\n"
+    config = json.dumps(config_to_container(args), indent=2, sort_keys=True, default=str) + "\n"
 
     diff = ""
     try:
@@ -125,13 +128,13 @@ def resolve_model_revision(model_name: str, revision: str | None) -> str | None:
     """Require immutable revisions for Hub models while allowing local directories."""
     if revision:
         if re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
-            raise ValueError("--model-revision must be a full 40-character commit hash")
+            raise ValueError("model.revision must be a full 40-character commit hash")
         return revision
     if Path(model_name).exists():
         return None
     if model_name in {DEFAULT_MODEL_NAME, "google-bert/bert-base-uncased"}:
         return DEFAULT_MODEL_REVISION
-    raise ValueError("--model-revision is required when --model-name refers to a Hub model")
+    raise ValueError("model.revision is required when model.name refers to a Hub model")
 
 
 def set_seed(seed: int) -> None:
@@ -195,7 +198,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     tokenizer: Any,
-    args: argparse.Namespace,
+    args: SimpleNamespace,
     step: int,
     checkpoint_name: str = "checkpoint.pt",
 ) -> Path:
@@ -291,15 +294,18 @@ def remove_old_periodic_checkpoints(output_dir: Path, keep_last: int) -> None:
         checkpoint.unlink()
 
 
-def train(args: argparse.Namespace) -> Path:
+def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
     set_seed(args.seed)
     if not 0.0 <= args.augmentation_strength <= 1.0:
         raise ValueError("augmentation_strength must be in [0, 1]")
     device = torch.device(args.device)
     args.model_revision = resolve_model_revision(args.model_name, args.model_revision)
-    save_run_artifacts(args.output_dir, args)
+    save_run_artifacts(args.output_dir, run_config if run_config is not None else args)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, revision=args.model_revision)
-    student = SentenceDINO.from_pretrained(
+    model_factory = (
+        SentenceDINO.from_random_init if args.random_init else SentenceDINO.from_pretrained
+    )
+    student = model_factory(
         args.model_name,
         revision=args.model_revision,
         dropout=args.dropout,
@@ -564,87 +570,10 @@ def train(args: argparse.Namespace) -> Path:
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train BERT-base with self-supervised text views")
-    parser.add_argument("--train-file", required=True, help="UTF-8 text, one sentence per line")
-    parser.add_argument("--output-dir", default="runs/minimal-dino")
-    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
-    parser.add_argument(
-        "--model-revision",
-        help=(
-            "Immutable Hub commit; required for non-default remote models. "
-            f"The default BERT model uses {DEFAULT_MODEL_REVISION}."
-        ),
-    )
-    parser.add_argument("--resume-from-checkpoint")
-    parser.add_argument(
-        "--save-steps", type=int, default=500, help="0 disables periodic checkpoints"
-    )
-    parser.add_argument(
-        "--keep-last-checkpoints", type=int, default=2, help="Periodic checkpoints to retain"
-    )
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=0, help="0 uses all epoch steps")
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--max-length", type=int, default=32)
-    parser.add_argument("--learning-rate", type=float, default=3e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-ratio", type=float, default=0.1)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.1,
-        help="BERT hidden and attention dropout probability",
-    )
-    parser.add_argument(
-        "--augmentation",
-        choices=("dropout", "word"),
-        default="dropout",
-        help="View augmentation method (default: dropout)",
-    )
-    parser.add_argument(
-        "--augmentation-strength",
-        type=float,
-        default=0.1,
-        help="Per-word augmentation probability in word mode",
-    )
-    parser.add_argument(
-        "--objective",
-        choices=("dino", "infonce"),
-        default="dino",
-        help="Self-supervised training objective (default: dino)",
-    )
-    parser.add_argument("--output-dim", type=int, default=65_536)
-    parser.add_argument("--head-hidden-dim", type=int, default=2_048)
-    parser.add_argument("--bottleneck-dim", type=int, default=256)
-    parser.add_argument("--student-temp", type=float, default=0.1)
-    parser.add_argument("--infonce-temp", type=float, default=0.05)
-    parser.add_argument("--teacher-temp", type=float, default=0.04)
-    parser.add_argument("--warmup-teacher-temp", type=float, default=0.04)
-    parser.add_argument("--teacher-temp-warmup-steps", type=int, default=0)
-    parser.add_argument("--teacher-momentum", type=float, default=0.996)
-    parser.add_argument("--center-momentum", type=float, default=0.9)
-    parser.add_argument("--log-steps", type=int, default=10)
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Show only a compact training progress bar",
-    )
-    parser.add_argument("--eval-steps", type=int, default=250, help="0 disables STS evaluation")
-    parser.add_argument("--eval-batch-size", type=int, default=64)
-    parser.add_argument("--eval-limit", type=int)
-    parser.add_argument("--stsb-dir", default="data/stsb")
-    parser.add_argument("--collapse-warning-after", type=int, default=100)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return parser
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    checkpoint = train(args)
+@hydra.main(version_base="1.3", config_path="conf", config_name="config")
+def main(config: DictConfig) -> None:
+    args = to_train_args(config)
+    checkpoint = train(args, run_config=config)
     if not args.quiet:
         print(f"Saved checkpoint to {checkpoint}")
 

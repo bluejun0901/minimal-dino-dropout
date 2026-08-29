@@ -36,26 +36,26 @@ if [[ ! -f "${TRAIN_FILE}" ]]; then
 fi
 
 COMMON_ARGS=(
-  --train-file "${TRAIN_FILE}"
-  --model-name bert-base-uncased
-  --model-revision 86b5e0934494bd15c9632b12f734a8a67f723594
-  --epochs 1
-  --batch-size 64
-  --max-length 32
-  --learning-rate 3e-5
-  --seed 42
-  --log-steps 10
-  --eval-steps 250
-  --save-steps 500
-  --keep-last-checkpoints 2
-  --device "${DEVICE}"
+  "data.train_file=${TRAIN_FILE}"
+  model.name=bert-base-uncased
+  model.revision=86b5e0934494bd15c9632b12f734a8a67f723594
+  optimization.epochs=1
+  optimization.batch_size=64
+  data.max_length=32
+  optimization.learning_rate=3e-5
+  runtime.seed=42
+  logging.steps=10
+  evaluation.steps=250
+  checkpoint.save_steps=500
+  checkpoint.keep_last=2
+  "runtime.device=${DEVICE}"
   "$@"
 )
 
 run_experiment() {
   local sweep_name="$1"
   local value="$2"
-  local varied_flag="$3"
+  local varied_key="$3"
   local output_dir="${OUTPUT_ROOT}/${sweep_name}/${sweep_name}-${value}"
 
   if [[ -e "${output_dir}" ]]; then
@@ -67,27 +67,27 @@ run_experiment() {
   echo "[$(date '+%F %T')] ${sweep_name}=${value} -> ${output_dir}"
   uv run python -m minimal_dino.train \
     "${COMMON_ARGS[@]}" \
-    --output-dir "${output_dir}" \
-    --dropout 0.1 \
-    --center-momentum 0.9 \
-    --teacher-momentum 0.996 \
-    "${varied_flag}" "${value}"
+    "runtime.output_dir=${output_dir}" \
+    model.dropout=0.1 \
+    objective.center_momentum=0.9 \
+    teacher.momentum=0.996 \
+    "${varied_key}=${value}"
 }
 
 if [[ "${SWEEP}" == "all" || "${SWEEP}" == "dropout" ]]; then
   for value in "${DROPOUT_VALUES[@]}"; do
-    run_experiment dropout "${value}" --dropout
+    run_experiment dropout "${value}" model.dropout
   done
 fi
 
 if [[ "${SWEEP}" == "all" || "${SWEEP}" == "center-momentum" ]]; then
   for value in "${CENTER_MOMENTUM_VALUES[@]}"; do
-    run_experiment center-momentum "${value}" --center-momentum
+    run_experiment center-momentum "${value}" objective.center_momentum
   done
 fi
 
 if [[ "${SWEEP}" == "all" || "${SWEEP}" == "teacher-momentum" ]]; then
   for value in "${TEACHER_MOMENTUM_VALUES[@]}"; do
-    run_experiment teacher-momentum "${value}" --teacher-momentum
+    run_experiment teacher-momentum "${value}" teacher.momentum
   done
 fi

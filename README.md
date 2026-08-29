@@ -63,60 +63,70 @@ source .venv/bin/activate
 export CUDA_VISIBLE_DEVICES=0
 
 uv run python -m minimal_dino.train \
-  --train-file data/wiki1m_for_simcse.txt \
-  --output-dir runs/dino-mean-bert-base-seed42 \
-  --model-name bert-base-uncased \
-  --model-revision 86b5e0934494bd15c9632b12f734a8a67f723594 \
-  --epochs 1 \
-  --batch-size 64 \
-  --max-length 32 \
-  --learning-rate 3e-5 \
-  --seed 42 \
-  --log-steps 10 \
-  --eval-steps 250 \
-  --save-steps 500 \
-  --keep-last-checkpoints 2 \
-  --device cuda
+  data.train_file=data/wiki1m_for_simcse.txt \
+  runtime.output_dir=runs/dino-mean-bert-base-seed42 \
+  optimization.epochs=1 \
+  optimization.batch_size=64 \
+  data.max_length=32 \
+  optimization.learning_rate=3e-5 \
+  runtime.seed=42 \
+  logging.steps=10 \
+  evaluation.steps=250 \
+  checkpoint.save_steps=500 \
+  checkpoint.keep_last=2 \
+  runtime.device=cuda
 ```
+
+Training configuration is composed by Hydra from files under `src/minimal_dino/conf`. The
+top-level defaults are split into `data`, `model`, `augmentation`, `objective`, `optimization`,
+`teacher`, `evaluation`, `checkpoint`, `runtime`, and `logging`. Override a field with
+`section.field=value`, or select a config-group option such as `objective=infonce` or
+`augmentation=word`. Hydra saves the composed YAML to
+`<runtime.output_dir>/.hydra/config.yaml`; the run also keeps its JSON reproduction artifact.
 
 The default DINO head is `2048 -> 2048 -> 256 -> 65536`, with student temperature 0.1,
 teacher temperature 0.04, center momentum 0.9, and teacher EMA momentum cosine-scheduled from
 0.996 to 1. BERT hidden and attention dropout are both 0.1 and can be changed together with
-`--dropout`. The token ids and masks are identical in every view; only BERT dropout masks differ.
+`model.dropout`. The token ids and masks are identical in every view; only BERT dropout masks
+differ.
 
-The default `--augmentation dropout` preserves that behavior. To compare it with word-level
+Set `model.random_init=true` to use the architecture and tokenizer selected by `model.name` without
+loading its pretrained encoder weights. The encoder is initialized randomly from the model
+configuration; the projection head is always initialized randomly regardless of this option.
+
+The default `augmentation=dropout` preserves that behavior. To compare it with word-level
 augmentation, use for example:
 
 ```bash
 uv run python -m minimal_dino.train \
-  --train-file data/wiki1m_for_simcse.txt \
-  --output-dir runs/dino-word-seed42 \
-  --augmentation word \
-  --augmentation-strength 0.1 \
-  --seed 42
+  data.train_file=data/wiki1m_for_simcse.txt \
+  runtime.output_dir=runs/dino-word-seed42 \
+  augmentation=word \
+  augmentation.strength=0.1 \
+  runtime.seed=42
 ```
 
-In word mode, each word is selected independently with probability `--augmentation-strength`.
+In word mode, each word is selected independently with probability `augmentation.strength`.
 Each selected word is then repeated once, deleted, or replaced by another word from its sentence,
 with the three operations chosen uniformly. Two views are generated before tokenization and BERT
 dropout is disabled. A strength of zero leaves the text unchanged.
 
-The default `--objective dino` preserves the original training behavior. To switch only the
+The default `objective=dino` preserves the original training behavior. To switch only the
 objective to InfoNCE, use:
 
 ```bash
 uv run python -m minimal_dino.train \
-  --train-file data/wiki1m_for_simcse.txt \
-  --output-dir runs/infonce-dropout-seed42 \
-  --objective infonce \
-  --infonce-temp 0.05 \
-  --seed 42
+  data.train_file=data/wiki1m_for_simcse.txt \
+  runtime.output_dir=runs/infonce-dropout-seed42 \
+  objective=infonce \
+  objective.temperature=0.05 \
+  runtime.seed=42
 ```
 
 InfoNCE uses the mean-pooled embeddings directly. Each example's two augmented views form the
 positive pair, all other examples in the batch are negatives, and the two view directions are
 averaged. The EMA teacher is still maintained and used for evaluation so that changing
-`--objective` does not silently change the rest of the training and evaluation pipeline.
+`objective` does not silently change the rest of the training and evaluation pipeline.
 
 Every 500 steps, training atomically writes a full resumable checkpoint named
 `checkpoint-step-N.pt`. Only the newest two periodic checkpoints are retained, because each full
@@ -127,11 +137,12 @@ and tokenizer.
 Training logs JSON diagnostics for loss, gradient norm, dropout-view cosine, center norm,
 teacher/student entropy, embedding standard deviation, and cross-sentence cosine.
 Every JSON record printed to stdout is also appended immediately to `metrics.jsonl` in the run
-directory. STS-B validation runs at step 0 and then at every `--eval-steps` interval. Each
+directory. STS-B validation runs at step 0 and then at every `evaluation.steps` interval. Each
 evaluation also reports embedding uniformity and the Spearman correlation between the current and
 initial BERT pairwise cosine-similarity values. Resumed runs append to the existing file without
 duplicating the step-0 record.
-Pass `--quiet` to show only a compact training progress bar while keeping the JSONL log unchanged.
+Set `logging.quiet=true` to show only a compact training progress bar while keeping the JSONL log
+unchanged.
 
 ## 4. Resume an interrupted run
 
@@ -142,21 +153,19 @@ source .venv/bin/activate
 export CUDA_VISIBLE_DEVICES=0
 
 uv run python -m minimal_dino.train \
-  --train-file data/wiki1m_for_simcse.txt \
-  --output-dir runs/dino-mean-bert-base-seed42 \
-  --model-name bert-base-uncased \
-  --model-revision 86b5e0934494bd15c9632b12f734a8a67f723594 \
-  --epochs 1 \
-  --batch-size 64 \
-  --max-length 32 \
-  --learning-rate 3e-5 \
-  --seed 42 \
-  --log-steps 10 \
-  --eval-steps 250 \
-  --save-steps 500 \
-  --keep-last-checkpoints 2 \
-  --device cuda \
-  --resume-from-checkpoint runs/dino-mean-bert-base-seed42/checkpoint-step-5000.pt
+  data.train_file=data/wiki1m_for_simcse.txt \
+  runtime.output_dir=runs/dino-mean-bert-base-seed42 \
+  optimization.epochs=1 \
+  optimization.batch_size=64 \
+  data.max_length=32 \
+  optimization.learning_rate=3e-5 \
+  runtime.seed=42 \
+  logging.steps=10 \
+  evaluation.steps=250 \
+  checkpoint.save_steps=500 \
+  checkpoint.keep_last=2 \
+  runtime.device=cuda \
+  checkpoint.resume_from=runs/dino-mean-bert-base-seed42/checkpoint-step-5000.pt
 ```
 
 Do not change the epoch count, batch size, schedule, seed, or projection-head dimensions when
@@ -210,10 +219,10 @@ CUDA_VISIBLE_DEVICES=0 scripts/sweep_hyperparameters.sh all
 ```
 
 Pass `dropout`, `center-momentum`, or `teacher-momentum` instead of `all` to run one grid. Results
-are written below `runs/sweeps`; `OUTPUT_ROOT`, `TRAIN_FILE`, and `DEVICE` can override those
-locations or the device. Additional training arguments are forwarded after the sweep name, for
-example `scripts/sweep_hyperparameters.sh dropout --max-steps 100` for a smoke run. The grids are
-defined near the top of the script.
+are written below `runs/sweeps-v2`; `OUTPUT_ROOT`, `TRAIN_FILE`, and `DEVICE` can override those
+locations or the device. Additional Hydra overrides are forwarded after the sweep name, for
+example `scripts/sweep_hyperparameters.sh dropout optimization.max_steps=100` for a smoke run.
+The grids are defined near the top of the script.
 
 For a quick implementation check:
 

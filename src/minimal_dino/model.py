@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 
 @contextmanager
@@ -102,6 +102,28 @@ class SentenceDINO(nn.Module):
                 attention_probs_dropout_prob=dropout,
             )
         encoder = AutoModel.from_pretrained(model_name, revision=revision, **model_kwargs)
+        return cls(encoder, **head_kwargs)
+
+    @classmethod
+    def from_random_init(
+        cls,
+        model_name: str = "bert-base-uncased",
+        *,
+        revision: str | None = None,
+        dropout: float | None = None,
+        **head_kwargs: int,
+    ) -> SentenceDINO:
+        """Build the requested encoder architecture without loading pretrained weights."""
+        config_kwargs = {}
+        if dropout is not None:
+            if not 0.0 <= dropout < 1.0:
+                raise ValueError("dropout must be in [0, 1)")
+            config_kwargs.update(
+                hidden_dropout_prob=dropout,
+                attention_probs_dropout_prob=dropout,
+            )
+        config = AutoConfig.from_pretrained(model_name, revision=revision, **config_kwargs)
+        encoder = AutoModel.from_config(config)
         return cls(encoder, **head_kwargs)
 
     def forward(

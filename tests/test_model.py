@@ -81,3 +81,46 @@ def test_from_pretrained_passes_revision_and_dropout(monkeypatch):
 def test_from_pretrained_rejects_invalid_dropout():
     with pytest.raises(ValueError, match="dropout must be"):
         SentenceDINO.from_pretrained("example/model", dropout=1.0)
+
+
+def test_from_random_init_loads_only_config_and_applies_dropout(monkeypatch):
+    captured = {}
+    config = SimpleNamespace(hidden_size=12)
+
+    def fake_config_from_pretrained(model_name, **kwargs):
+        captured["config"] = {"model_name": model_name, **kwargs}
+        return config
+
+    def fake_model_from_config(actual_config):
+        captured["model_config"] = actual_config
+        return TinyEncoder()
+
+    def fail_if_pretrained_is_loaded(*args, **kwargs):
+        raise AssertionError("pretrained weights must not be loaded")
+
+    monkeypatch.setattr(
+        "minimal_dino.model.AutoConfig.from_pretrained", fake_config_from_pretrained
+    )
+    monkeypatch.setattr("minimal_dino.model.AutoModel.from_config", fake_model_from_config)
+    monkeypatch.setattr(
+        "minimal_dino.model.AutoModel.from_pretrained", fail_if_pretrained_is_loaded
+    )
+
+    SentenceDINO.from_random_init(
+        "example/model", revision="immutable-commit", dropout=0.2, output_dim=16
+    )
+
+    assert captured == {
+        "config": {
+            "model_name": "example/model",
+            "revision": "immutable-commit",
+            "hidden_dropout_prob": 0.2,
+            "attention_probs_dropout_prob": 0.2,
+        },
+        "model_config": config,
+    }
+
+
+def test_from_random_init_rejects_invalid_dropout():
+    with pytest.raises(ValueError, match="dropout must be"):
+        SentenceDINO.from_random_init("example/model", dropout=1.0)

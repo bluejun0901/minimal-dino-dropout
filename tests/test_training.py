@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from hydra import compose, initialize_config_module
 from torch import nn
 
 from minimal_dino.model import SentenceDINO
@@ -12,7 +13,6 @@ from minimal_dino.objective import DINOLoss
 from minimal_dino.train import (
     DEFAULT_MODEL_REVISION,
     _print_progress,
-    build_parser,
     cosine_teacher_momentum,
     log_metrics,
     remove_old_periodic_checkpoints,
@@ -144,7 +144,7 @@ def test_default_model_resolves_to_immutable_revision():
 
 
 def test_custom_hub_model_requires_revision():
-    with pytest.raises(ValueError, match="--model-revision"):
+    with pytest.raises(ValueError, match="model.revision"):
         resolve_model_revision("organization/model", None)
 
 
@@ -230,18 +230,35 @@ def test_save_run_artifacts_survives_missing_git(tmp_path, monkeypatch):
     assert (tmp_path / "git.diff").read_text() == ""
 
 
-def test_cli_defaults_to_dino_and_can_select_infonce():
-    parser = build_parser()
+def test_hydra_config_groups_compose_and_translate_to_training_args():
+    from minimal_dino.config import to_train_args
 
-    default_args = parser.parse_args(["--train-file", "train.txt"])
-    infonce_args = parser.parse_args(
-        ["--train-file", "train.txt", "--objective", "infonce", "--infonce-temp", "0.2"]
-    )
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        default_config = compose(
+            config_name="config", overrides=["data.train_file=train.txt"]
+        )
+        alternate_config = compose(
+            config_name="config",
+            overrides=[
+                "data.train_file=train.txt",
+                "objective=infonce",
+                "objective.temperature=0.2",
+                "augmentation=word",
+                "model.random_init=true",
+                "logging.quiet=true",
+                "runtime.device=cpu",
+            ],
+        )
+
+    default_args = to_train_args(default_config)
+    alternate_args = to_train_args(alternate_config)
 
     assert default_args.objective == "dino"
+    assert default_args.augmentation == "dropout"
     assert default_args.quiet is False
-    assert infonce_args.objective == "infonce"
-    assert infonce_args.infonce_temp == 0.2
-
-    quiet_args = parser.parse_args(["--train-file", "train.txt", "--quiet"])
-    assert quiet_args.quiet is True
+    assert default_args.random_init is False
+    assert alternate_args.objective == "infonce"
+    assert alternate_args.infonce_temp == 0.2
+    assert alternate_args.augmentation == "word"
+    assert alternate_args.random_init is True
+    assert alternate_args.quiet is True

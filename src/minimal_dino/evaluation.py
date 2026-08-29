@@ -37,7 +37,7 @@ def encode_sentences(
     *,
     device: torch.device,
     batch_size: int = 64,
-    max_length: int = 32,
+    max_length: int = 128,
 ) -> torch.Tensor:
     model.eval()
     loader = DataLoader(
@@ -111,7 +111,7 @@ def encode_stsb_dataset(
     *,
     device: torch.device,
     batch_size: int = 64,
-    max_length: int = 32,
+    max_length: int = 128,
     limit: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
     if limit is not None:
@@ -168,7 +168,7 @@ def evaluate_stsb(
     *,
     device: torch.device,
     batch_size: int = 64,
-    max_length: int = 32,
+    max_length: int = 128,
     limit: int | None = None,
     initial_embeddings: torch.Tensor | None = None,
 ) -> dict[str, float]:
@@ -209,7 +209,7 @@ def main() -> None:
     parser.add_argument("--split", default="validation", choices=("validation", "test"))
     parser.add_argument("--stsb-dir", default="data/stsb")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--max-length", type=int, default=32)
+    parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
