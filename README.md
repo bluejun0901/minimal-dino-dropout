@@ -12,7 +12,7 @@ bert-base-uncased -> attention-mask-aware mean pooling
 
 There is no token masking, predictor, auxiliary loss, or multi-crop analogue. Sentence embeddings
 are mean-pooled last-layer token representations before the DINO head; padding tokens are excluded.
-Evaluation disables augmentation and uses the EMA teacher.
+Evaluation disables augmentation and uses the online student.
 
 ## 1. Create the environment
 
@@ -90,6 +90,10 @@ teacher temperature 0.04, center momentum 0.9, and teacher EMA momentum cosine-s
 `model.dropout`. The token ids and masks are identical in every view; only BERT dropout masks
 differ.
 
+For DINO, set `objective.reset_interval=N` to reset its state after every `N` completed optimizer
+steps. A reset copies the online student directly to the teacher and zeros the center. Its default
+value is `null`, which keeps the original EMA teacher and center behavior unchanged.
+
 Set `model.random_init=true` to use the architecture and tokenizer selected by `model.name` without
 loading its pretrained encoder weights. The encoder is initialized randomly from the model
 configuration; the projection head is always initialized randomly regardless of this option.
@@ -125,8 +129,8 @@ uv run python -m minimal_dino.train \
 
 InfoNCE uses the mean-pooled embeddings directly. Each example's two augmented views form the
 positive pair, all other examples in the batch are negatives, and the two view directions are
-averaged. The EMA teacher is still maintained and used for evaluation so that changing
-`objective` does not silently change the rest of the training and evaluation pipeline.
+averaged. The EMA teacher is still maintained for training, while evaluation consistently uses
+the online student regardless of the selected objective.
 
 Every 500 steps, training atomically writes a full resumable checkpoint named
 `checkpoint-step-N.pt`. Only the newest two periodic checkpoints are retained, because each full
@@ -137,7 +141,15 @@ and tokenizer.
 Training logs JSON diagnostics for loss, gradient norm, dropout-view cosine, center norm,
 teacher/student entropy, embedding standard deviation, and cross-sentence cosine.
 Every JSON record printed to stdout is also appended immediately to `metrics.jsonl` in the run
-directory. STS-B validation runs at step 0 and then at every `evaluation.steps` interval. Each
+directory. The same values are written to `<runtime.output_dir>/tensorboard` under `train/*` and
+`eval/*` tags. View them while training with:
+
+```bash
+uv run tensorboard --logdir runs
+```
+
+Set `logging.tensorboard=false` to disable TensorBoard logging. STS-B validation runs at step 0 and
+then at every `evaluation.steps` interval. Each
 evaluation also reports embedding uniformity and alignment: the mean squared Euclidean distance
 between L2-normalized embeddings for STS pairs whose normalized score is higher than 0.8. STS
 sentences are evaluated without truncation. Resumed runs append to the existing file without
@@ -172,7 +184,7 @@ uv run python -m minimal_dino.train \
 Do not change the epoch count, batch size, schedule, seed, or projection-head dimensions when
 resuming. Checkpoints from the earlier `[CLS]`-pooling implementation are intentionally rejected.
 
-## 5. Evaluate the EMA teacher
+## 5. Evaluate the student
 
 ```bash
 source .venv/bin/activate
@@ -185,7 +197,7 @@ uv run python -m minimal_dino.evaluation \
 
 This reads the previously downloaded STS-B split from `data/stsb`; evaluation performs no dataset
 Hub calls. It then reports Spearman/Pearson correlations, collapse diagnostics, and uniformity from
-deterministic mean-pooled EMA-teacher embeddings, plus alignment over STS positive pairs (score at
+deterministic mean-pooled student embeddings, plus alignment over STS positive pairs (score at
 greater than 0.8). Evaluation does not truncate STS sentences. Pass `--stsb-dir` if the files are
 elsewhere.
 

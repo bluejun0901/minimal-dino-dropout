@@ -17,6 +17,7 @@ import torch
 from omegaconf import DictConfig
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from minimal_dino.config import config_to_container, to_train_args
@@ -102,8 +103,10 @@ def log_metrics(
     metrics: dict[str, float | int],
     *,
     quiet: bool = False,
+    tensorboard_writer: SummaryWriter | None = None,
+    namespace: str | None = None,
 ) -> None:
-    """Emit one metrics record to stdout and the run's append-only JSONL file."""
+    """Emit one metrics record to stdout, JSONL, and optionally TensorBoard."""
     line = json.dumps(metrics, sort_keys=True)
     if not quiet:
         print(line, flush=True)
@@ -112,6 +115,13 @@ def log_metrics(
     with path.open("a", encoding="utf-8") as stream:
         stream.write(line + "\n")
         stream.flush()
+    if tensorboard_writer is not None:
+        step = int(metrics["step"])
+        for name, value in metrics.items():
+            if name != "step":
+                tag = f"{namespace}/{name}" if namespace else name
+                tensorboard_writer.add_scalar(tag, value, step)
+        tensorboard_writer.flush()
 
 
 def _print_progress(step: int, total_steps: int, width: int = 30) -> None:
@@ -179,6 +189,20 @@ def update_teacher(student: SentenceDINO, teacher: SentenceDINO, momentum: float
         if name not in student_buffers:
             raise RuntimeError(f"Teacher buffer has no student counterpart: {name}")
         teacher_buffer.copy_(student_buffers[name])
+
+
+@torch.no_grad()
+def reset_dino_state(
+    student: SentenceDINO, teacher: SentenceDINO, objective: DINOLoss
+) -> None:
+    """Synchronize the teacher with the student and clear the DINO center."""
+    update_teacher(student, teacher, momentum=0.0)
+    objective.center.zero_()
+
+
+def is_dino_reset_step(completed_step: int, reset_interval: int | None) -> bool:
+    """Return whether a completed optimizer step is a configured reset boundary."""
+    return reset_interval is not None and completed_step % reset_interval == 0
 
 
 def off_diagonal_cosine(embeddings: torch.Tensor) -> torch.Tensor:
@@ -298,6 +322,13 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
     set_seed(args.seed)
     if not 0.0 <= args.augmentation_strength <= 1.0:
         raise ValueError("augmentation_strength must be in [0, 1]")
+    dino_reset_interval = getattr(args, "dino_reset_interval", None)
+    if dino_reset_interval is not None and (
+        isinstance(dino_reset_interval, bool)
+        or not isinstance(dino_reset_interval, int)
+        or dino_reset_interval < 1
+    ):
+        raise ValueError("objective.reset_interval must be null or a positive integer")
     device = torch.device(args.device)
     args.model_revision = resolve_model_revision(args.model_name, args.model_revision)
     save_run_artifacts(args.output_dir, run_config if run_config is not None else args)
@@ -364,10 +395,16 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
     if args.keep_last_checkpoints < 1:
         raise ValueError("keep_last_checkpoints must be at least 1")
 
+    tensorboard_writer = (
+        SummaryWriter(log_dir=Path(args.output_dir) / "tensorboard")
+        if getattr(args, "tensorboard", True)
+        else None
+    )
+
     step_zero_eval_metrics = None
     if evaluation_dataset is not None:
         embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
-            teacher,
+            student,
             tokenizer,
             evaluation_dataset,
             device=device,
@@ -396,6 +433,8 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
             args.output_dir,
             {"step": 0, **step_zero_eval_metrics},
             quiet=args.quiet,
+            tensorboard_writer=tensorboard_writer,
+            namespace="eval",
         )
     dropout_warning_emitted = False
     collapse_warning_emitted = False
@@ -451,10 +490,21 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
             optimizer.step()
             scheduler.step()
 
-            momentum = cosine_teacher_momentum(global_step, total_steps, args.teacher_momentum)
-            update_teacher(student, teacher, momentum)
-            if isinstance(objective, DINOLoss):
-                objective.update_center((teacher_view1.logits, teacher_view2.logits))
+            should_reset_dino = (
+                isinstance(objective, DINOLoss)
+                and is_dino_reset_step(global_step + 1, dino_reset_interval)
+            )
+            if should_reset_dino:
+                optimizer.state.clear()
+                reset_dino_state(student, teacher, objective)
+                momentum = 0.0
+            else:
+                momentum = cosine_teacher_momentum(
+                    global_step, total_steps, args.teacher_momentum
+                )
+                update_teacher(student, teacher, momentum)
+                if isinstance(objective, DINOLoss):
+                    objective.update_center((teacher_view1.logits, teacher_view2.logits))
             optimizer.zero_grad(set_to_none=True)
 
             student_view_cosine = F.cosine_similarity(
@@ -502,13 +552,19 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                     "pairwise_cosine": pairwise_cosine.item(),
                     **{name: value.item() for name, value in loss_metrics.items()},
                 }
-                log_metrics(args.output_dir, log, quiet=args.quiet)
+                log_metrics(
+                    args.output_dir,
+                    log,
+                    quiet=args.quiet,
+                    tensorboard_writer=tensorboard_writer,
+                    namespace="train",
+                )
 
             if args.eval_steps and global_step % args.eval_steps == 0:
                 if evaluation_dataset is None:
                     raise RuntimeError("Evaluation data was not initialized")
                 embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
-                    teacher,
+                    student,
                     tokenizer,
                     evaluation_dataset,
                     device=device,
@@ -524,8 +580,9 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                     args.output_dir,
                     {"step": global_step, **metrics},
                     quiet=args.quiet,
+                    tensorboard_writer=tensorboard_writer,
+                    namespace="eval",
                 )
-                teacher.eval()
                 student.train()
 
             if args.save_steps and global_step % args.save_steps == 0:
@@ -551,7 +608,7 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
 
     if any(parameter.grad is not None for parameter in teacher.parameters()):
         raise RuntimeError("A gradient unexpectedly reached the teacher")
-    return save_checkpoint(
+    checkpoint = save_checkpoint(
         Path(args.output_dir),
         student,
         teacher,
@@ -562,6 +619,9 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
         args,
         global_step,
     )
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
+    return checkpoint
 
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")

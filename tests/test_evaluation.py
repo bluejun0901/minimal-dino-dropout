@@ -3,9 +3,11 @@ import pytest
 import torch
 from datasets import Dataset
 
+import minimal_dino.evaluation as evaluation
 from minimal_dino.evaluation import (
     embedding_diagnostics,
     encode_sentences,
+    load_checkpoint,
     load_stsb_split,
     stsb_metrics,
 )
@@ -25,6 +27,45 @@ def test_load_stsb_split_reads_local_parquet(tmp_path):
 def test_load_stsb_split_reports_missing_download(tmp_path):
     with pytest.raises(FileNotFoundError, match="Download the pinned files"):
         load_stsb_split(tmp_path, "validation")
+
+
+def test_load_checkpoint_uses_student_weights(tmp_path, monkeypatch):
+    checkpoint = {
+        "encoder_config": {"model_type": "fake", "hidden_size": 2},
+        "head_config": {"output_dim": 3},
+        "student": {"weight": torch.tensor([1.0])},
+        "teacher": {"weight": torch.tensor([2.0])},
+    }
+
+    class FakeModel:
+        def __init__(self, encoder, **head_config):
+            self.encoder = encoder
+            self.head_config = head_config
+            self.loaded_state = None
+
+        def load_state_dict(self, state):
+            self.loaded_state = state
+
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(evaluation.torch, "load", lambda *args, **kwargs: checkpoint)
+    monkeypatch.setattr(
+        evaluation.AutoConfig, "for_model", lambda model_type, **config: config
+    )
+    monkeypatch.setattr(evaluation.AutoModel, "from_config", lambda config: config)
+    monkeypatch.setattr(evaluation, "SentenceDINO", FakeModel)
+    monkeypatch.setattr(
+        evaluation.AutoTokenizer, "from_pretrained", lambda path: "tokenizer"
+    )
+
+    model, tokenizer = load_checkpoint(tmp_path / "checkpoint.pt", torch.device("cpu"))
+
+    assert model.loaded_state is checkpoint["student"]
+    assert tokenizer == "tokenizer"
 
 
 def test_embedding_diagnostics_reports_uniformity():

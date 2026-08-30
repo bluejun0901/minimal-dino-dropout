@@ -49,6 +49,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         objective=objective["name"],
         student_temp=objective.get("student_temp", 0.1),
         center_momentum=objective.get("center_momentum", 0.9),
+        dino_reset_interval=objective.get("reset_interval"),
         infonce_temp=objective.get("temperature", 0.05),
         epochs=optimization["epochs"],
         max_steps=optimization["max_steps"],
@@ -74,6 +75,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         device=device,
         log_steps=logging["steps"],
         quiet=logging["quiet"],
+        tensorboard=logging["tensorboard"],
     )
 
 

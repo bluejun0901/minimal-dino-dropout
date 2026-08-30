@@ -14,8 +14,10 @@ from minimal_dino.train import (
     DEFAULT_MODEL_REVISION,
     _print_progress,
     cosine_teacher_momentum,
+    is_dino_reset_step,
     log_metrics,
     remove_old_periodic_checkpoints,
+    reset_dino_state,
     resolve_model_revision,
     restore_checkpoint,
     save_checkpoint,
@@ -82,6 +84,29 @@ def test_teacher_momentum_cosine_schedule_reaches_one():
     assert values[0] == 0.996
     assert values[-1] == 1.0
     assert values == sorted(values)
+
+
+def test_reset_dino_state_copies_student_and_zeros_center():
+    student = SentenceDINO(TinyEncoder(), output_dim=12, head_hidden_dim=16, bottleneck_dim=4)
+    teacher = copy.deepcopy(student).eval().requires_grad_(False)
+    objective = DINOLoss(12)
+
+    with torch.no_grad():
+        next(student.parameters()).add_(1)
+        objective.center.fill_(2)
+    reset_dino_state(student, teacher, objective)
+
+    assert all(
+        torch.equal(student_value, teacher.state_dict()[name])
+        for name, student_value in student.state_dict().items()
+    )
+    assert torch.equal(objective.center, torch.zeros_like(objective.center))
+    assert all(parameter.grad is None for parameter in teacher.parameters())
+
+
+def test_dino_reset_interval_uses_completed_steps_and_none_disables_it():
+    assert [step for step in range(1, 8) if is_dino_reset_step(step, 3)] == [3, 6]
+    assert not any(is_dino_reset_step(step, None) for step in range(1, 8))
 
 
 class TinyTokenizer:
@@ -179,6 +204,31 @@ def test_quiet_metrics_only_write_jsonl(tmp_path, capsys):
     assert json.loads((tmp_path / "metrics.jsonl").read_text()) == metrics
 
 
+def test_log_metrics_writes_namespaced_tensorboard_scalars(tmp_path):
+    class RecordingWriter:
+        def __init__(self):
+            self.scalars = []
+            self.flush_count = 0
+
+        def add_scalar(self, tag, value, step):
+            self.scalars.append((tag, value, step))
+
+        def flush(self):
+            self.flush_count += 1
+
+    writer = RecordingWriter()
+    log_metrics(
+        tmp_path,
+        {"step": 4, "loss": 1.25, "lr": 3e-5},
+        quiet=True,
+        tensorboard_writer=writer,
+        namespace="train",
+    )
+
+    assert writer.scalars == [("train/loss", 1.25, 4), ("train/lr", 3e-5, 4)]
+    assert writer.flush_count == 1
+
+
 def test_progress_bar_finishes_with_newline(capsys):
     _print_progress(2, 2, width=4)
 
@@ -237,6 +287,10 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
         default_config = compose(
             config_name="config", overrides=["data.train_file=train.txt"]
         )
+        reset_config = compose(
+            config_name="config",
+            overrides=["data.train_file=train.txt", "objective.reset_interval=25"],
+        )
         alternate_config = compose(
             config_name="config",
             overrides=[
@@ -246,19 +300,25 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
                 "augmentation=word",
                 "model.random_init=true",
                 "logging.quiet=true",
+                "logging.tensorboard=false",
                 "runtime.device=cpu",
             ],
         )
 
     default_args = to_train_args(default_config)
+    reset_args = to_train_args(reset_config)
     alternate_args = to_train_args(alternate_config)
 
     assert default_args.objective == "dino"
+    assert default_args.dino_reset_interval is None
+    assert reset_args.dino_reset_interval == 25
     assert default_args.augmentation == "dropout"
-    assert default_args.quiet is False
+    assert default_args.quiet is True
+    assert default_args.tensorboard is True
     assert default_args.random_init is False
     assert alternate_args.objective == "infonce"
     assert alternate_args.infonce_temp == 0.2
     assert alternate_args.augmentation == "word"
     assert alternate_args.random_init is True
     assert alternate_args.quiet is True
+    assert alternate_args.tensorboard is False

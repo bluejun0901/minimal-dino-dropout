@@ -66,3 +66,6 @@ runs/
 # OS
 .DS_Store
 Thumbs.db
+
+# utility
+utils/

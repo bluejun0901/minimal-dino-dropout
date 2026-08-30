@@ -168,7 +168,7 @@ def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceDIN
     encoder_config = AutoConfig.for_model(model_type, **config_dict)
     encoder = AutoModel.from_config(encoder_config)
     model = SentenceDINO(encoder, **checkpoint["head_config"])
-    model.load_state_dict(checkpoint["teacher"])
+    model.load_state_dict(checkpoint["student"])
     model.to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(path.parent / "tokenizer")
     return model, tokenizer
