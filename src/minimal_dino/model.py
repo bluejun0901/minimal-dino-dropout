@@ -81,6 +81,7 @@ class SentenceDINO(nn.Module):
         self.encoder = encoder
         hidden_size = encoder.config.hidden_size
         self.head = DINOHead(hidden_size, output_dim, head_hidden_dim, bottleneck_dim)
+        self.cls_mlp_head = nn.Linear(encoder.config.hidden_size, encoder.config.hidden_size)
 
     @classmethod
     def from_pretrained(
@@ -141,9 +142,11 @@ class SentenceDINO(nn.Module):
                 attention_mask=attention_mask,
                 return_dict=True,
             ).last_hidden_state
-        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-        embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        return DINOOutput(embedding=embedding, logits=self.head(embedding))
+        embedding = hidden[:, 0, :]
+        mlp_cls = self.cls_mlp_head(embedding)
+        # mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+        # embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        return DINOOutput(embedding=embedding, logits=self.head(mlp_cls))
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Return the pre-projection masked-mean sentence representation without dropout."""

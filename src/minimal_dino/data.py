@@ -29,18 +29,17 @@ class TextLineDataset(Dataset[str]):
 
 
 class TokenizeCollator:
-    def __init__(self, tokenizer: Any, max_length: int = 32) -> None:
+    def __init__(self, tokenizer: Any, max_length: int | None = 512) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __call__(self, sentences: list[str]) -> dict[str, torch.Tensor]:
-        batch = self.tokenizer(
-            sentences,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
+        length_options = (
+            {"truncation": True, "max_length": self.max_length}
+            if self.max_length is not None
+            else {"truncation": False}
         )
+        batch = self.tokenizer(sentences, padding=True, return_tensors="pt", **length_options)
         return {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
 
 

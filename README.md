@@ -67,7 +67,7 @@ uv run python -m minimal_dino.train \
   runtime.output_dir=runs/dino-mean-bert-base-seed42 \
   optimization.epochs=1 \
   optimization.batch_size=64 \
-  data.max_length=32 \
+  data.max_length=512 \
   optimization.learning_rate=3e-5 \
   runtime.seed=42 \
   logging.steps=10 \
@@ -138,8 +138,9 @@ Training logs JSON diagnostics for loss, gradient norm, dropout-view cosine, cen
 teacher/student entropy, embedding standard deviation, and cross-sentence cosine.
 Every JSON record printed to stdout is also appended immediately to `metrics.jsonl` in the run
 directory. STS-B validation runs at step 0 and then at every `evaluation.steps` interval. Each
-evaluation also reports embedding uniformity and the Spearman correlation between the current and
-initial BERT pairwise cosine-similarity values. Resumed runs append to the existing file without
+evaluation also reports embedding uniformity and alignment: the mean squared Euclidean distance
+between L2-normalized embeddings for STS pairs whose normalized score is higher than 0.8. STS
+sentences are evaluated without truncation. Resumed runs append to the existing file without
 duplicating the step-0 record.
 Set `logging.quiet=true` to show only a compact training progress bar while keeping the JSONL log
 unchanged.
@@ -157,7 +158,7 @@ uv run python -m minimal_dino.train \
   runtime.output_dir=runs/dino-mean-bert-base-seed42 \
   optimization.epochs=1 \
   optimization.batch_size=64 \
-  data.max_length=32 \
+  data.max_length=512 \
   optimization.learning_rate=3e-5 \
   runtime.seed=42 \
   logging.steps=10 \
@@ -184,9 +185,9 @@ uv run python -m minimal_dino.evaluation \
 
 This reads the previously downloaded STS-B split from `data/stsb`; evaluation performs no dataset
 Hub calls. It then reports Spearman/Pearson correlations, collapse diagnostics, and uniformity from
-deterministic mean-pooled EMA-teacher embeddings. During training, evaluation additionally reports
-pairwise-cosine Spearman correlation relative to cached step-0 BERT embeddings. Pass `--stsb-dir`
-if the files are elsewhere.
+deterministic mean-pooled EMA-teacher embeddings, plus alignment over STS positive pairs (score at
+greater than 0.8). Evaluation does not truncate STS sentences. Pass `--stsb-dir` if the files are
+elsewhere.
 
 ## 6. Plot training metrics
 

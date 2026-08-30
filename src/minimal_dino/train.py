@@ -364,24 +364,20 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
     if args.keep_last_checkpoints < 1:
         raise ValueError("keep_last_checkpoints must be at least 1")
 
-    initial_eval_embeddings = None
-    initial_eval_metrics = None
+    step_zero_eval_metrics = None
     if evaluation_dataset is not None:
-        initial_embedding1, initial_embedding2, evaluation_scores = encode_stsb_dataset(
+        embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
             teacher,
             tokenizer,
             evaluation_dataset,
             device=device,
             batch_size=args.eval_batch_size,
-            max_length=args.max_length,
             limit=args.eval_limit,
         )
-        initial_eval_embeddings = torch.cat((initial_embedding1, initial_embedding2))
-        initial_eval_metrics = stsb_metrics(
-            initial_embedding1,
-            initial_embedding2,
+        step_zero_eval_metrics = stsb_metrics(
+            embedding1,
+            embedding2,
             evaluation_scores,
-            initial_embeddings=initial_eval_embeddings,
         )
 
     global_step = 0
@@ -395,10 +391,10 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
             _print_progress(global_step, total_steps)
         else:
             print(f"Resumed from {args.resume_from_checkpoint} at step {global_step}", flush=True)
-    elif initial_eval_metrics is not None:
+    elif step_zero_eval_metrics is not None:
         log_metrics(
             args.output_dir,
-            {"step": 0, **initial_eval_metrics},
+            {"step": 0, **step_zero_eval_metrics},
             quiet=args.quiet,
         )
     dropout_warning_emitted = False
@@ -509,7 +505,7 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                 log_metrics(args.output_dir, log, quiet=args.quiet)
 
             if args.eval_steps and global_step % args.eval_steps == 0:
-                if evaluation_dataset is None or initial_eval_embeddings is None:
+                if evaluation_dataset is None:
                     raise RuntimeError("Evaluation data was not initialized")
                 embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
                     teacher,
@@ -517,14 +513,12 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                     evaluation_dataset,
                     device=device,
                     batch_size=args.eval_batch_size,
-                    max_length=args.max_length,
                     limit=args.eval_limit,
                 )
                 metrics = stsb_metrics(
                     embedding1,
                     embedding2,
                     evaluation_scores,
-                    initial_embeddings=initial_eval_embeddings,
                 )
                 log_metrics(
                     args.output_dir,

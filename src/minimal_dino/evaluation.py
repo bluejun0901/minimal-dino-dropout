@@ -37,14 +37,13 @@ def encode_sentences(
     *,
     device: torch.device,
     batch_size: int = 64,
-    max_length: int = 128,
 ) -> torch.Tensor:
     model.eval()
     loader = DataLoader(
         sentences,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=TokenizeCollator(tokenizer, max_length),
+        collate_fn=TokenizeCollator(tokenizer, max_length=None),
     )
     embeddings = []
     for batch in loader:
@@ -55,7 +54,6 @@ def encode_sentences(
 
 def embedding_diagnostics(
     embeddings: torch.Tensor,
-    initial_embeddings: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Cheap collapse indicators on deterministic, pre-head sentence embeddings."""
     normalized = F.normalize(embeddings.float(), dim=-1)
@@ -76,32 +74,13 @@ def embedding_diagnostics(
     singular_values = torch.linalg.svdvals(embeddings.float() - embeddings.float().mean(0))
     probabilities = singular_values / singular_values.sum().clamp_min(1e-12)
     effective_rank = torch.exp(-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).item()
-    metrics = {
+    return {
         "embedding_std": embeddings.float().std(dim=0, unbiased=False).mean().item(),
         "pairwise_cosine_mean": pairwise_mean,
         "pairwise_cosine_std": pairwise_std,
         "uniformity": uniformity,
         "effective_rank": effective_rank,
     }
-    if initial_embeddings is not None:
-        if initial_embeddings.shape != embeddings.shape:
-            raise ValueError(
-                "Initial and current embeddings must have the same shape, got "
-                f"{tuple(initial_embeddings.shape)} and {tuple(embeddings.shape)}"
-            )
-        if n > 1:
-            initial_normalized = F.normalize(initial_embeddings.float(), dim=-1)
-            initial_similarities = initial_normalized @ initial_normalized.T
-            initial_distinct = initial_similarities[indices[0], indices[1]]
-            metrics["initial_pairwise_cosine_spearman"] = float(
-                spearmanr(
-                    distinct.detach().cpu().numpy(),
-                    initial_distinct.detach().cpu().numpy(),
-                ).statistic
-            )
-        else:
-            metrics["initial_pairwise_cosine_spearman"] = float("nan")
-    return metrics
 
 
 def encode_stsb_dataset(
@@ -111,7 +90,6 @@ def encode_stsb_dataset(
     *,
     device: torch.device,
     batch_size: int = 64,
-    max_length: int = 128,
     limit: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
     if limit is not None:
@@ -127,7 +105,6 @@ def encode_stsb_dataset(
         sentence1,
         device=device,
         batch_size=batch_size,
-        max_length=max_length,
     )
     embedding2 = encode_sentences(
         model,
@@ -135,7 +112,6 @@ def encode_stsb_dataset(
         sentence2,
         device=device,
         batch_size=batch_size,
-        max_length=max_length,
     )
     return embedding1, embedding2, scores
 
@@ -144,20 +120,23 @@ def stsb_metrics(
     embedding1: torch.Tensor,
     embedding2: torch.Tensor,
     scores: np.ndarray,
-    *,
-    initial_embeddings: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    similarities = F.cosine_similarity(embedding1, embedding2).numpy()
+    normalized1 = F.normalize(embedding1.float(), dim=-1)
+    normalized2 = F.normalize(embedding2.float(), dim=-1)
+    similarities = F.cosine_similarity(normalized1, normalized2).numpy()
+    positive_mask = torch.as_tensor(scores > 0.8, dtype=torch.bool)
+    squared_distances = (normalized1 - normalized2).square().sum(dim=-1)
+    alignment = (
+        squared_distances[positive_mask].mean().item()
+        if positive_mask.any()
+        else float("nan")
+    )
     metrics = {
         "sts_spearman": float(spearmanr(similarities, scores).statistic),
         "sts_pearson": float(pearsonr(similarities, scores).statistic),
+        "alignment": alignment,
     }
-    metrics.update(
-        embedding_diagnostics(
-            torch.cat((embedding1, embedding2)),
-            initial_embeddings=initial_embeddings,
-        )
-    )
+    metrics.update(embedding_diagnostics(torch.cat((embedding1, embedding2))))
     return metrics
 
 
@@ -168,9 +147,7 @@ def evaluate_stsb(
     *,
     device: torch.device,
     batch_size: int = 64,
-    max_length: int = 128,
     limit: int | None = None,
-    initial_embeddings: torch.Tensor | None = None,
 ) -> dict[str, float]:
     embedding1, embedding2, scores = encode_stsb_dataset(
         model,
@@ -178,15 +155,9 @@ def evaluate_stsb(
         dataset,
         device=device,
         batch_size=batch_size,
-        max_length=max_length,
         limit=limit,
     )
-    return stsb_metrics(
-        embedding1,
-        embedding2,
-        scores,
-        initial_embeddings=initial_embeddings,
-    )
+    return stsb_metrics(embedding1, embedding2, scores)
 
 
 def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceDINO, Any]:
@@ -209,7 +180,6 @@ def main() -> None:
     parser.add_argument("--split", default="validation", choices=("validation", "test"))
     parser.add_argument("--stsb-dir", default="data/stsb")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -223,7 +193,6 @@ def main() -> None:
         dataset,
         device=device,
         batch_size=args.batch_size,
-        max_length=args.max_length,
         limit=args.limit,
     )
     print(json.dumps(metrics, indent=2, sort_keys=True))
