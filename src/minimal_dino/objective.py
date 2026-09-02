@@ -67,6 +67,8 @@ class DINOLoss(nn.Module):
         self.center.mul_(self.center_momentum).add_(batch_center, alpha=1 - self.center_momentum)
 
 
+
+
 class InfoNCELoss(nn.Module):
     """Symmetric in-batch InfoNCE over two augmented sentence views."""
 

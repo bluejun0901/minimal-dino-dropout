@@ -27,7 +27,7 @@ from minimal_dino.evaluation import (
     load_stsb_split,
     stsb_metrics,
 )
-from minimal_dino.model import SentenceDINO
+from minimal_dino.model import SentenceDINO, checkpoint_model_config, model_config
 from minimal_dino.objective import DINOLoss, InfoNCELoss, build_objective
 
 DEFAULT_MODEL_NAME = "bert-base-uncased"
@@ -195,7 +195,8 @@ def update_teacher(student: SentenceDINO, teacher: SentenceDINO, momentum: float
 def reset_dino_state(
     student: SentenceDINO, teacher: SentenceDINO, objective: DINOLoss
 ) -> None:
-    """Synchronize the teacher with the student and clear the DINO center."""
+    """Reinitialize the student DINO head, synchronize it, and clear the center."""
+    student.head.reset_parameters()
     update_teacher(student, teacher, momentum=0.0)
     objective.center.zero_()
 
@@ -228,11 +229,7 @@ def save_checkpoint(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(output_dir / "tokenizer")
-    head_config = {
-        "output_dim": student.head.last_weight.shape[0],
-        "head_hidden_dim": student.head.mlp[0].out_features,
-        "bottleneck_dim": student.head.last_weight.shape[1],
-    }
+    head_config = model_config(student)
     checkpoint_path = output_dir / checkpoint_name
     temporary_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
     torch.save(
@@ -245,7 +242,7 @@ def save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "encoder_config": student.encoder.config.to_dict(),
             "head_config": head_config,
-            "pooling": "mean",
+            "pooling": student.pooling,
             "args": vars(args),
             "step": step,
             "python_random_state": random.getstate(),
@@ -279,15 +276,16 @@ def restore_checkpoint(
             f"Checkpoint objective is {checkpoint_objective}, but this run uses "
             f"{objective_name(objective)}"
         )
-    expected_head_config = {
-        "output_dim": student.head.last_weight.shape[0],
-        "head_hidden_dim": student.head.mlp[0].out_features,
-        "bottleneck_dim": student.head.last_weight.shape[1],
-    }
-    if checkpoint["head_config"] != expected_head_config:
+    checkpoint_head_config = checkpoint_model_config(checkpoint)
+    expected_head_config = model_config(student)
+    compared_keys = {"output_dim", "pooling", "use_mlp"}
+    if expected_head_config["use_mlp"]:
+        compared_keys.update({"head_hidden_dim", "bottleneck_dim"})
+    if any(
+        checkpoint_head_config[name] != expected_head_config[name]
+        for name in compared_keys
+    ):
         raise ValueError("Checkpoint projection-head configuration does not match this run")
-    if checkpoint.get("pooling") != "mean":
-        raise ValueError("Checkpoint was not created with mean pooling")
     student.load_state_dict(checkpoint["student"])
     teacher.load_state_dict(checkpoint["teacher"])
     objective.load_state_dict(checkpoint["objective"])
@@ -319,7 +317,9 @@ def remove_old_periodic_checkpoints(output_dir: Path, keep_last: int) -> None:
 
 
 def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
+    torch.set_float32_matmul_precision("high")
     set_seed(args.seed)
+
     if not 0.0 <= args.augmentation_strength <= 1.0:
         raise ValueError("augmentation_strength must be in [0, 1]")
     dino_reset_interval = getattr(args, "dino_reset_interval", None)
@@ -340,6 +340,8 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
         args.model_name,
         revision=args.model_revision,
         dropout=args.dropout,
+        pooling=args.pooling,
+        use_mlp=args.use_mlp,
         output_dim=args.output_dim,
         head_hidden_dim=args.head_hidden_dim,
         bottleneck_dim=args.bottleneck_dim,
@@ -455,8 +457,8 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                 student_view1 = student(**batch, use_dropout=True)
                 student_view2 = student(**batch, use_dropout=True)
                 with torch.no_grad():
-                    teacher_view1 = teacher(**batch, use_dropout=False)
-                    teacher_view2 = teacher(**batch, use_dropout=False)
+                    teacher_view1 = teacher(**batch, use_dropout=False, is_teacher=True)
+                    teacher_view2 = teacher(**batch, use_dropout=False, is_teacher=True)
             else:
                 view1, view2 = (
                     {name: value.to(device) for name, value in view.items()} for view in batch
@@ -464,8 +466,8 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                 student_view1 = student(**view1, use_dropout=False)
                 student_view2 = student(**view2, use_dropout=False)
                 with torch.no_grad():
-                    teacher_view1 = teacher(**view1, use_dropout=False)
-                    teacher_view2 = teacher(**view2, use_dropout=False)
+                    teacher_view1 = teacher(**view1, use_dropout=False, is_teacher=True)
+                    teacher_view2 = teacher(**view2, use_dropout=False, is_teacher=True)
 
             temperature = teacher_temperature(
                 global_step,

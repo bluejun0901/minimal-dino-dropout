@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 from minimal_dino.data import TokenizeCollator
-from minimal_dino.model import SentenceDINO
+from minimal_dino.model import SentenceDINO, checkpoint_model_config
 
 
 def load_stsb_split(data_dir: str | Path, split: str) -> Any:
@@ -167,7 +167,7 @@ def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceDIN
     model_type = config_dict.pop("model_type")
     encoder_config = AutoConfig.for_model(model_type, **config_dict)
     encoder = AutoModel.from_config(encoder_config)
-    model = SentenceDINO(encoder, **checkpoint["head_config"])
+    model = SentenceDINO(encoder, **checkpoint_model_config(checkpoint))
     model.load_state_dict(checkpoint["student"])
     model.to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(path.parent / "tokenizer")

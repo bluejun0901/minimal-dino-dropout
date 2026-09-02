@@ -28,6 +28,10 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         raise ValueError("augmentation.name must be 'dropout' or 'word'")
     if objective["name"] not in {"dino", "infonce"}:
         raise ValueError("objective.name must be 'dino' or 'infonce'")
+    if model["pooling"] not in {"cls", "mean"}:
+        raise ValueError("model.pooling must be 'cls' or 'mean'")
+    if not isinstance(model["use_mlp"], bool):
+        raise ValueError("model.use_mlp must be a boolean")
 
     device = runtime["device"]
     if device == "auto":
@@ -41,6 +45,8 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         model_revision=model["revision"],
         random_init=model["random_init"],
         dropout=model["dropout"],
+        pooling=model["pooling"],
+        use_mlp=model["use_mlp"],
         output_dim=model["output_dim"],
         head_hidden_dim=model["head_hidden_dim"],
         bottleneck_dim=model["bottleneck_dim"],

@@ -57,6 +57,51 @@ def test_sentence_embedding_is_masked_mean_before_projection_head():
     assert output.logits.shape == (1, 16)
 
 
+def test_sentence_embedding_can_use_cls_pooling():
+    model = SentenceDINO(
+        TinyEncoder(dropout=0.0),
+        output_dim=16,
+        head_hidden_dim=24,
+        bottleneck_dim=8,
+        pooling="cls",
+    )
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 0]]),
+    }
+    hidden = model.encoder(**batch).last_hidden_state
+
+    output = model(**batch, use_dropout=False)
+
+    assert torch.equal(output.embedding, hidden[:, 0, :])
+
+
+@pytest.mark.parametrize("use_mlp", [True, False])
+def test_projection_head_can_enable_or_disable_mlp(use_mlp):
+    model = SentenceDINO(
+        TinyEncoder(dropout=0.0),
+        output_dim=16,
+        head_hidden_dim=24,
+        bottleneck_dim=8,
+        use_mlp=use_mlp,
+    ).eval()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+    }
+
+    output = model(**batch, use_dropout=False, is_teacher=True)
+
+    expected_projection_dim = 8 if use_mlp else 12
+    assert model.head.last_weight.shape == (16, expected_projection_dim)
+    assert torch.isfinite(output.logits).all()
+
+
+def test_sentence_dino_rejects_invalid_pooling():
+    with pytest.raises(ValueError, match="pooling"):
+        SentenceDINO(TinyEncoder(), pooling="max")
+
+
 def test_from_pretrained_passes_revision_and_dropout(monkeypatch):
     captured = {}
 

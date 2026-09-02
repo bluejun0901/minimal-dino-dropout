@@ -86,7 +86,7 @@ def test_teacher_momentum_cosine_schedule_reaches_one():
     assert values == sorted(values)
 
 
-def test_reset_dino_state_copies_student_and_zeros_center():
+def test_reset_dino_state_reinitializes_head_copies_student_and_zeros_center():
     student = SentenceDINO(TinyEncoder(), output_dim=12, head_hidden_dim=16, bottleneck_dim=4)
     teacher = copy.deepcopy(student).eval().requires_grad_(False)
     objective = DINOLoss(12)
@@ -94,8 +94,18 @@ def test_reset_dino_state_copies_student_and_zeros_center():
     with torch.no_grad():
         next(student.parameters()).add_(1)
         objective.center.fill_(2)
+    encoder_before = copy.deepcopy(student.encoder.state_dict())
+    head_before = copy.deepcopy(student.head.state_dict())
     reset_dino_state(student, teacher, objective)
 
+    assert all(
+        torch.equal(value, encoder_before[name])
+        for name, value in student.encoder.state_dict().items()
+    )
+    assert any(
+        not torch.equal(value, head_before[name])
+        for name, value in student.head.state_dict().items()
+    )
     assert all(
         torch.equal(student_value, teacher.state_dict()[name])
         for name, student_value in student.state_dict().items()
@@ -114,9 +124,19 @@ class TinyTokenizer:
         path.mkdir(parents=True, exist_ok=True)
 
 
-def test_checkpoint_round_trip_restores_models_optimizer_center_and_rng(tmp_path):
+@pytest.mark.parametrize("pooling,use_mlp", [("mean", True), ("cls", False)])
+def test_checkpoint_round_trip_restores_models_optimizer_center_and_rng(
+    tmp_path, pooling, use_mlp
+):
     torch.manual_seed(7)
-    student = SentenceDINO(TinyEncoder(), output_dim=12, head_hidden_dim=16, bottleneck_dim=4)
+    student = SentenceDINO(
+        TinyEncoder(),
+        output_dim=12,
+        head_hidden_dim=16,
+        bottleneck_dim=4,
+        pooling=pooling,
+        use_mlp=use_mlp,
+    )
     teacher = copy.deepcopy(student).eval().requires_grad_(False)
     objective = DINOLoss(12)
     optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
@@ -299,6 +319,8 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
                 "objective.temperature=0.2",
                 "augmentation=word",
                 "model.random_init=true",
+                "model.pooling=cls",
+                "model.use_mlp=true",
                 "logging.quiet=true",
                 "logging.tensorboard=false",
                 "runtime.device=cpu",
@@ -316,9 +338,13 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     assert default_args.quiet is True
     assert default_args.tensorboard is True
     assert default_args.random_init is False
+    assert default_args.pooling == "mean"
+    assert default_args.use_mlp is False
     assert alternate_args.objective == "infonce"
     assert alternate_args.infonce_temp == 0.2
     assert alternate_args.augmentation == "word"
     assert alternate_args.random_init is True
+    assert alternate_args.pooling == "cls"
+    assert alternate_args.use_mlp is True
     assert alternate_args.quiet is True
     assert alternate_args.tensorboard is False

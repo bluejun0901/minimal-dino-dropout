@@ -2,6 +2,8 @@ name: bert-base-uncased
 revision: 86b5e0934494bd15c9632b12f734a8a67f723594
 random_init: false
 dropout: 0.1
+pooling: mean
+use_mlp: true
 output_dim: 65536
 head_hidden_dim: 2048
 bottleneck_dim: 256

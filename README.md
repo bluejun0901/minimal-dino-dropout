@@ -4,15 +4,15 @@ This repository is a deliberately narrow baseline with independently selectable 
 view augmentation:
 
 ```text
-bert-base-uncased -> attention-mask-aware mean pooling
+bert-base-uncased -> configurable [CLS] or attention-mask-aware mean pooling
     -> two independent dropout or word-augmented views
     -> DINO: student / EMA teacher -> centered, sharpened cross-entropy
     -> InfoNCE: student view 1 / student view 2 -> symmetric in-batch contrastive loss
 ```
 
 There is no token masking, predictor, auxiliary loss, or multi-crop analogue. Sentence embeddings
-are mean-pooled last-layer token representations before the DINO head; padding tokens are excluded.
-Evaluation disables augmentation and uses the online student.
+come from the configured last-layer pooling before the DINO head. Mean pooling excludes padding
+tokens. Evaluation disables augmentation and uses the online student.
 
 ## 1. Create the environment
 
@@ -84,11 +84,13 @@ top-level defaults are split into `data`, `model`, `augmentation`, `objective`, 
 `augmentation=word`. Hydra saves the composed YAML to
 `<runtime.output_dir>/.hydra/config.yaml`; the run also keeps its JSON reproduction artifact.
 
-The default DINO head is `2048 -> 2048 -> 256 -> 65536`, with student temperature 0.1,
-teacher temperature 0.04, center momentum 0.9, and teacher EMA momentum cosine-scheduled from
-0.996 to 1. BERT hidden and attention dropout are both 0.1 and can be changed together with
-`model.dropout`. The token ids and masks are identical in every view; only BERT dropout masks
-differ.
+The default uses mean pooling and applies the normalized output layer directly to the pooled BERT
+representation. Set `model.pooling=cls` to use the first token instead, and set
+`model.use_mlp=true` to enable the `2048 -> 2048 -> 256` projection MLP before the output layer.
+These choices are stored in checkpoints and must match when resuming. Student temperature is 0.1,
+center momentum is 0.9, and teacher EMA momentum is cosine-scheduled from 0.996 to 1. BERT hidden
+and attention dropout are both 0.1 and can be changed together with `model.dropout`. The token ids
+and masks are identical in every dropout view; only BERT dropout masks differ.
 
 For DINO, set `objective.reset_interval=N` to reset its state after every `N` completed optimizer
 steps. A reset copies the online student directly to the teacher and zeros the center. Its default
@@ -127,10 +129,10 @@ uv run python -m minimal_dino.train \
   runtime.seed=42
 ```
 
-InfoNCE uses the mean-pooled embeddings directly. Each example's two augmented views form the
-positive pair, all other examples in the batch are negatives, and the two view directions are
-averaged. The EMA teacher is still maintained for training, while evaluation consistently uses
-the online student regardless of the selected objective.
+InfoNCE uses the configured pooled embeddings directly. Each example's two augmented views form
+the positive pair, all other examples in the batch are negatives, and the two view directions are
+averaged. The EMA teacher is still maintained for training, while evaluation consistently uses the
+online student regardless of the selected objective.
 
 Every 500 steps, training atomically writes a full resumable checkpoint named
 `checkpoint-step-N.pt`. Only the newest two periodic checkpoints are retained, because each full
@@ -181,8 +183,8 @@ uv run python -m minimal_dino.train \
   checkpoint.resume_from=runs/dino-mean-bert-base-seed42/checkpoint-step-5000.pt
 ```
 
-Do not change the epoch count, batch size, schedule, seed, or projection-head dimensions when
-resuming. Checkpoints from the earlier `[CLS]`-pooling implementation are intentionally rejected.
+Do not change the epoch count, batch size, schedule, seed, pooling mode, MLP selection, or
+projection-head dimensions when resuming.
 
 ## 5. Evaluate the student
 
@@ -197,9 +199,9 @@ uv run python -m minimal_dino.evaluation \
 
 This reads the previously downloaded STS-B split from `data/stsb`; evaluation performs no dataset
 Hub calls. It then reports Spearman/Pearson correlations, collapse diagnostics, and uniformity from
-deterministic mean-pooled student embeddings, plus alignment over STS positive pairs (score at
-greater than 0.8). Evaluation does not truncate STS sentences. Pass `--stsb-dir` if the files are
-elsewhere.
+deterministic student embeddings using the pooling mode stored in the checkpoint, plus alignment
+over STS positive pairs (score greater than 0.8). Evaluation does not truncate STS sentences. Pass
+`--stsb-dir` if the files are elsewhere.
 
 ## 6. Plot training metrics
 

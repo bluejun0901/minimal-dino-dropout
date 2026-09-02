@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 import torch
 from torch import nn
@@ -23,6 +24,29 @@ def dropout_mode(module: nn.Module, enabled: bool):
             child.train(was_training)
 
 
+class UniformityLoss(nn.Module):
+    def __init__(self, t: float = 2.0):
+        super().__init__()
+        if t <= 0:
+            raise ValueError("t must be positive")
+        self.t = t
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if embeddings.shape[0] < 2:
+            return embeddings.sum() * 0.0
+        embeddings = F.normalize(embeddings, dim=-1)
+        similarity_matrix = embeddings @ embeddings.T
+        # Exclude diagonal elements (self-similarity) from the loss.
+        mask = ~torch.eye(
+            similarity_matrix.shape[0],
+            dtype=torch.bool,
+            device=similarity_matrix.device,
+        )
+        similarity_matrix = similarity_matrix[mask].view(similarity_matrix.shape[0], -1)
+        distance_square_matrix = 2 - 2 * similarity_matrix
+        return torch.logsumexp(-distance_square_matrix * self.t, dim=-1).mean()
+
+
 class DINOHead(nn.Module):
     """The BN-free three-layer projection head used by DINO.
 
@@ -36,29 +60,65 @@ class DINOHead(nn.Module):
         output_dim: int = 65_536,
         hidden_dim: int = 2_048,
         bottleneck_dim: int = 256,
+        use_mlp: bool = True,
     ) -> None:
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, bottleneck_dim),
-        )
-        self.last_weight = nn.Parameter(torch.empty(output_dim, bottleneck_dim))
+        if not isinstance(use_mlp, bool):
+            raise ValueError("use_mlp must be a boolean")
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.bottleneck_dim = bottleneck_dim
+        self.use_mlp = use_mlp
+        if use_mlp:
+            self.mlp = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, bottleneck_dim),
+            )
+            projection_dim = bottleneck_dim
+        else:
+            self.mlp = nn.Identity()
+            projection_dim = input_dim
+        self.last_weight = nn.Parameter(torch.empty(output_dim, projection_dim))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for layer in self.mlp:
+        for layer in self.mlp.modules():
             if isinstance(layer, nn.Linear):
                 nn.init.trunc_normal_(layer.weight, std=0.02)
                 nn.init.zeros_(layer.bias)
         nn.init.trunc_normal_(self.last_weight, std=0.02)
 
-    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
-        bottleneck = F.normalize(self.mlp(embedding), dim=-1)
+    def uniformity_grad(self, z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
+        if z.shape[0] < 2:
+            return torch.zeros_like(z)
+        diff = z[:, None, :] - z[None, :, :]
+        dist2 = diff.square().sum(dim=-1)
+        weight = torch.exp(-t * dist2)
+        mask = ~torch.eye(z.shape[0], dtype=torch.bool, device=z.device)
+        weight = weight * mask
+        denominator = weight.sum() / 2
+        grad = -2 * t * (weight[..., None] * diff).sum(dim=1) / denominator.clamp_min(
+            torch.finfo(z.dtype).tiny
+        )
+        return grad
+
+    def uniformize_embedding(
+        self, embedding: torch.Tensor, step_size: float = 0.01
+    ) -> torch.Tensor:
+        grad = self.uniformity_grad(embedding)
+        return F.normalize(embedding - step_size * grad, dim=-1)
+
+    def forward(self, embedding: torch.Tensor, is_teacher: bool = False) -> torch.Tensor:
+        projection = F.normalize(self.mlp(embedding), dim=-1)
         weight = F.normalize(self.last_weight, dim=-1)
-        return F.linear(bottleneck, weight)
+        if not self.training and is_teacher:
+            projection = self.uniformize_embedding(projection, step_size=0.01)
+
+        return F.linear(projection, weight)
 
 
 @dataclass
@@ -68,7 +128,7 @@ class DINOOutput:
 
 
 class SentenceDINO(nn.Module):
-    """Mean-pooled BERT encoder followed by a DINO projection head."""
+    """Configurable BERT sentence pooling followed by a DINO projection head."""
 
     def __init__(
         self,
@@ -76,12 +136,23 @@ class SentenceDINO(nn.Module):
         output_dim: int = 65_536,
         head_hidden_dim: int = 2_048,
         bottleneck_dim: int = 256,
+        pooling: str = "mean",
+        use_mlp: bool = True,
     ) -> None:
         super().__init__()
+        if pooling not in {"cls", "mean"}:
+            raise ValueError("pooling must be 'cls' or 'mean'")
         self.encoder = encoder
+        self.pooling = pooling
+        self.use_mlp = use_mlp
         hidden_size = encoder.config.hidden_size
-        self.head = DINOHead(hidden_size, output_dim, head_hidden_dim, bottleneck_dim)
-        # self.cls_mlp_head = nn.Linear(encoder.config.hidden_size, encoder.config.hidden_size)
+        self.head = DINOHead(
+            hidden_size,
+            output_dim,
+            head_hidden_dim,
+            bottleneck_dim,
+            use_mlp=use_mlp,
+        )
 
     @classmethod
     def from_pretrained(
@@ -90,7 +161,7 @@ class SentenceDINO(nn.Module):
         *,
         revision: str | None = None,
         dropout: float | None = None,
-        **head_kwargs: int,
+        **head_kwargs: Any,
     ) -> SentenceDINO:
         model_kwargs = {}
         if dropout is not None:
@@ -112,7 +183,7 @@ class SentenceDINO(nn.Module):
         *,
         revision: str | None = None,
         dropout: float | None = None,
-        **head_kwargs: int,
+        **head_kwargs: Any,
     ) -> SentenceDINO:
         """Build the requested encoder architecture without loading pretrained weights."""
         config_kwargs = {}
@@ -133,6 +204,7 @@ class SentenceDINO(nn.Module):
         attention_mask: torch.Tensor,
         *,
         use_dropout: bool,
+        is_teacher: bool = False,
     ) -> DINOOutput:
         # Calling the same encoder twice gives independent masks. The context is needed
         # for the EMA teacher, which otherwise stays in eval mode and disables dropout.
@@ -142,12 +214,38 @@ class SentenceDINO(nn.Module):
                 attention_mask=attention_mask,
                 return_dict=True,
             ).last_hidden_state
-        # embedding = hidden[:, 0, :]
-        # mlp_cls = self.cls_mlp_head(embedding)
-        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-        embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        return DINOOutput(embedding=embedding, logits=self.head(embedding))
+        if self.pooling == "cls":
+            embedding = hidden[:, 0, :]
+        else:
+            mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+            embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        logits = self.head(embedding, is_teacher=is_teacher)
+        return DINOOutput(embedding=embedding, logits=logits)
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Return the pre-projection masked-mean sentence representation without dropout."""
-        return self(input_ids, attention_mask, use_dropout=False).embedding
+        """Return the configured pre-projection sentence representation without dropout."""
+        return self(input_ids, attention_mask, use_dropout=False, is_teacher=False).embedding
+
+
+def model_config(model: SentenceDINO) -> dict[str, Any]:
+    """Return the architecture choices needed to reconstruct a sentence model."""
+    return {
+        "output_dim": model.head.output_dim,
+        "head_hidden_dim": model.head.hidden_dim,
+        "bottleneck_dim": model.head.bottleneck_dim,
+        "pooling": model.pooling,
+        "use_mlp": model.use_mlp,
+    }
+
+
+def checkpoint_model_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """Read model choices, including checkpoints created before explicit switches."""
+    config = dict(checkpoint["head_config"])
+    student_state = checkpoint["student"]
+    config.setdefault("pooling", checkpoint.get("pooling", "mean"))
+    config.setdefault(
+        "use_mlp", any(name.startswith("head.mlp.") for name in student_state)
+    )
+    config.setdefault("head_hidden_dim", 2_048)
+    config.setdefault("bottleneck_dim", 256)
+    return config
