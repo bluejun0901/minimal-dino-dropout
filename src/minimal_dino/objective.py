@@ -26,25 +26,40 @@ class DINOLoss(nn.Module):
         student_views: tuple[torch.Tensor, torch.Tensor],
         teacher_views: tuple[torch.Tensor, torch.Tensor],
         teacher_temp: float,
+        *,
+        compute_metrics: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if teacher_temp <= 0:
             raise ValueError("teacher_temp must be positive")
 
+        # Keep the large-temperature-scaled softmaxes in FP32 even when the encoders and
+        # projection heads run under BF16 autocast.
         student_log_probs = tuple(
-            F.log_softmax(view / self.student_temp, dim=-1) for view in student_views
+            F.log_softmax(view.float() / self.student_temp, dim=-1) for view in student_views
         )
-        teacher_probs = tuple(
-            F.softmax((view - self.center) / teacher_temp, dim=-1).detach()
-            for view in teacher_views
-        )
+        if teacher_views[0] is teacher_views[1]:
+            # Dropout augmentation gives the deterministic EMA teacher the same input
+            # twice. Reuse its distribution instead of launching a duplicate softmax.
+            teacher_prob = F.softmax(
+                (teacher_views[0].float() - self.center) / teacher_temp, dim=-1
+            ).detach()
+            teacher_probs = (teacher_prob, teacher_prob)
+        else:
+            teacher_probs = tuple(
+                F.softmax((view.float() - self.center) / teacher_temp, dim=-1).detach()
+                for view in teacher_views
+            )
 
         # Match only opposite dropout views, as in DINO's two-global-view pseudocode.
         loss_12 = -(teacher_probs[0] * student_log_probs[1]).sum(dim=-1).mean()
         loss_21 = -(teacher_probs[1] * student_log_probs[0]).sum(dim=-1).mean()
         loss = (loss_12 + loss_21) / 2
 
+        if not compute_metrics:
+            return loss, {}
+
         teacher_prob = torch.cat(teacher_probs)
-        student_prob = torch.cat(tuple(log_prob.exp() for log_prob in student_log_probs))
+        student_prob = torch.cat(tuple(log_prob.detach().exp() for log_prob in student_log_probs))
         eps = torch.finfo(teacher_prob.dtype).eps
         metrics = {
             "teacher_entropy": -(teacher_prob * teacher_prob.clamp_min(eps).log())
@@ -63,7 +78,10 @@ class DINOLoss(nn.Module):
     @torch.no_grad()
     def update_center(self, teacher_views: tuple[torch.Tensor, torch.Tensor]) -> None:
         # Update after computing the loss, so the current batch uses the previous center.
-        batch_center = torch.cat(teacher_views).mean(dim=0, keepdim=True)
+        if teacher_views[0] is teacher_views[1]:
+            batch_center = teacher_views[0].float().mean(dim=0, keepdim=True)
+        else:
+            batch_center = torch.cat(teacher_views).float().mean(dim=0, keepdim=True)
         self.center.mul_(self.center_momentum).add_(batch_center, alpha=1 - self.center_momentum)
 
 

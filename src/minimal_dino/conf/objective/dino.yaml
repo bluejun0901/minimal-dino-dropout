@@ -1,4 +1,4 @@
 name: dino
 student_temp: 0.1
 center_momentum: 0.9
-reset_interval: null
+reset_interval: 20

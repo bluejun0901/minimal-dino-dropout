@@ -15,6 +15,7 @@ from minimal_dino.train import (
     _print_progress,
     cosine_teacher_momentum,
     is_dino_reset_step,
+    load_max_logged_metric,
     log_metrics,
     remove_old_periodic_checkpoints,
     reset_dino_state,
@@ -224,6 +225,24 @@ def test_quiet_metrics_only_write_jsonl(tmp_path, capsys):
     assert json.loads((tmp_path / "metrics.jsonl").read_text()) == metrics
 
 
+def test_load_max_logged_metric_uses_all_valid_previous_evaluations(tmp_path):
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"step": 0, "sts_spearman": 0.3}),
+                json.dumps({"step": 100, "sts_spearman": 0.7}),
+                "not-json",
+                json.dumps({"step": 200, "sts_spearman": 0.6}),
+            ]
+        )
+        + "\n"
+    )
+
+    assert load_max_logged_metric(tmp_path, "sts_spearman") == 0.7
+    assert load_max_logged_metric(tmp_path, "missing") is None
+
+
 def test_log_metrics_writes_namespaced_tensorboard_scalars(tmp_path):
     class RecordingWriter:
         def __init__(self):
@@ -337,9 +356,10 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     assert default_args.augmentation == "dropout"
     assert default_args.quiet is True
     assert default_args.tensorboard is True
+    assert default_args.dino_precision == "bf16"
     assert default_args.random_init is False
     assert default_args.pooling == "mean"
-    assert default_args.use_mlp is False
+    assert default_args.use_mlp is True
     assert alternate_args.objective == "infonce"
     assert alternate_args.infonce_temp == 0.2
     assert alternate_args.augmentation == "word"

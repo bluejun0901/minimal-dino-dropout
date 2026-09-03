@@ -7,9 +7,10 @@ import random
 import re
 import subprocess
 import warnings
+import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import hydra
 import numpy as np
@@ -27,12 +28,13 @@ from minimal_dino.evaluation import (
     load_stsb_split,
     stsb_metrics,
 )
-from minimal_dino.model import SentenceDINO, checkpoint_model_config, model_config
+from minimal_dino.model import DINOOutput, SentenceDINO, checkpoint_model_config, model_config
 from minimal_dino.objective import DINOLoss, InfoNCELoss, build_objective
 
 DEFAULT_MODEL_NAME = "bert-base-uncased"
 DEFAULT_MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def _write_text_atomically(path: Path, content: str) -> None:
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -124,6 +126,23 @@ def log_metrics(
         tensorboard_writer.flush()
 
 
+def load_max_logged_metric(output_dir: str | Path, name: str) -> float | None:
+    """Return the largest finite metric value already recorded for a run."""
+    path = Path(output_dir) / "metrics.jsonl"
+    if not path.is_file():
+        return None
+    maximum = None
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                value = json.loads(line).get(name)
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                maximum = value if maximum is None else max(maximum, value)
+    return maximum
+
+
 def _print_progress(step: int, total_steps: int, width: int = 30) -> None:
     filled = int(width * step / total_steps)
     bar = "#" * filled + "-" * (width - filled)
@@ -172,15 +191,28 @@ def teacher_temperature(
 
 
 @torch.no_grad()
-def update_teacher(student: SentenceDINO, teacher: SentenceDINO, momentum: float) -> None:
-    student_parameters = dict(student.named_parameters())
-    teacher_parameters = dict(teacher.named_parameters())
-    if student_parameters.keys() != teacher_parameters.keys():
+def update_teacher(
+    student: SentenceDINO,
+    teacher: SentenceDINO,
+    momentum: float,
+    *,
+    use_foreach: bool = False,
+) -> None:
+    student_parameters = tuple(student.named_parameters())
+    teacher_parameters = tuple(teacher.named_parameters())
+    if tuple(name for name, _ in student_parameters) != tuple(
+        name for name, _ in teacher_parameters
+    ):
         raise RuntimeError("Student and teacher parameters do not match")
-    for name, teacher_parameter in teacher_parameters.items():
-        teacher_parameter.mul_(momentum).add_(
-            student_parameters[name].detach(), alpha=1.0 - momentum
-        )
+    teacher_tensors = [parameter for _, parameter in teacher_parameters]
+    student_tensors = [parameter.detach() for _, parameter in student_parameters]
+    if use_foreach:
+        torch._foreach_lerp_(teacher_tensors, student_tensors, 1.0 - momentum)
+    else:
+        for teacher_parameter, student_parameter in zip(teacher_tensors, student_tensors):
+            teacher_parameter.mul_(momentum).add_(
+                student_parameter, alpha=1.0 - momentum
+            )
 
     # BERT's non-trainable buffers (for example position ids) are copied exactly.
     student_buffers = dict(student.named_buffers())
@@ -197,7 +229,7 @@ def reset_dino_state(
 ) -> None:
     """Reinitialize the student DINO head, synchronize it, and clear the center."""
     student.head.reset_parameters()
-    update_teacher(student, teacher, momentum=0.0)
+    update_teacher(student, teacher, momentum=0.0, use_foreach=True)
     objective.center.zero_()
 
 
@@ -278,7 +310,7 @@ def restore_checkpoint(
         )
     checkpoint_head_config = checkpoint_model_config(checkpoint)
     expected_head_config = model_config(student)
-    compared_keys = {"output_dim", "pooling", "use_mlp"}
+    compared_keys = {"output_dim", "pooling", "use_mlp", "uniformity_step_size"}
     if expected_head_config["use_mlp"]:
         compared_keys.update({"head_hidden_dim", "bottleneck_dim"})
     if any(
@@ -316,7 +348,12 @@ def remove_old_periodic_checkpoints(output_dir: Path, keep_last: int) -> None:
         checkpoint.unlink()
 
 
-def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
+def train(
+    args: SimpleNamespace,
+    run_config: Any | None = None,
+    evaluation_callback: Callable[[int, dict[str, float]], None] | None = None,
+    save_final_checkpoint: bool = True,
+) -> Path | None:
     torch.set_float32_matmul_precision("high")
     set_seed(args.seed)
 
@@ -345,6 +382,7 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
         output_dim=args.output_dim,
         head_hidden_dim=args.head_hidden_dim,
         bottleneck_dim=args.bottleneck_dim,
+        uniformity_step_size=args.uniformity_step_size,
     ).to(device)
     teacher = copy.deepcopy(student).to(device).eval()
     teacher.requires_grad_(False)
@@ -355,6 +393,13 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
         center_momentum=args.center_momentum,
         infonce_temp=args.infonce_temp,
     ).to(device)
+    dino_precision = getattr(args, "dino_precision", "bf16")
+    if dino_precision not in {"fp32", "bf16"}:
+        raise ValueError("runtime.dino_precision must be 'fp32' or 'bf16'")
+    optimize_dino_cuda = isinstance(objective, DINOLoss) and device.type == "cuda"
+    use_dino_bf16 = optimize_dino_cuda and dino_precision == "bf16"
+    if use_dino_bf16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("runtime.dino_precision=bf16 requires a BF16-capable CUDA device")
 
     if not all(torch.equal(a, b) for a, b in zip(student.parameters(), teacher.parameters())):
         raise RuntimeError("Teacher was not initialized exactly from the student")
@@ -379,6 +424,12 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
         num_workers=args.num_workers,
         generator=generator,
         drop_last=False,
+        pin_memory=optimize_dino_cuda,
+        persistent_workers=(
+            isinstance(objective, DINOLoss)
+            and args.augmentation == "dropout"
+            and args.num_workers > 0
+        ),
     )
     steps_per_epoch = len(loader)
     requested_steps = args.epochs * steps_per_epoch
@@ -386,9 +437,13 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
     if total_steps < 1:
         raise ValueError("Training requires at least one optimizer step")
 
-    optimizer = torch.optim.AdamW(
-        student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
-    )
+    optimizer_kwargs = {
+        "lr": args.learning_rate,
+        "weight_decay": args.weight_decay,
+    }
+    if optimize_dino_cuda:
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(student.parameters(), **optimizer_kwargs)
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
@@ -404,6 +459,7 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
     )
 
     step_zero_eval_metrics = None
+    max_sts_spearman = load_max_logged_metric(args.output_dir, "sts_spearman")
     if evaluation_dataset is not None:
         embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
             student,
@@ -431,6 +487,14 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
         else:
             print(f"Resumed from {args.resume_from_checkpoint} at step {global_step}", flush=True)
     elif step_zero_eval_metrics is not None:
+        max_sts_spearman = max(
+            max_sts_spearman if max_sts_spearman is not None else -math.inf,
+            step_zero_eval_metrics["sts_spearman"],
+        )
+        step_zero_eval_metrics = {
+            **step_zero_eval_metrics,
+            "max_sts_spearman": max_sts_spearman,
+        }
         log_metrics(
             args.output_dir,
             {"step": 0, **step_zero_eval_metrics},
@@ -438,7 +502,9 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
             tensorboard_writer=tensorboard_writer,
             namespace="eval",
         )
-    dropout_warning_emitted = False
+        if evaluation_callback is not None:
+            evaluation_callback(0, step_zero_eval_metrics)
+    dropout_views_checked = False
     collapse_warning_emitted = False
     student.train()
     optimizer.zero_grad(set_to_none=True)
@@ -452,40 +518,86 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
         for batch_index, batch in enumerate(loader):
             if epoch == start_epoch and batch_index < resume_batch:
                 continue
-            if args.augmentation == "dropout":
-                batch = {name: value.to(device) for name, value in batch.items()}
-                student_view1 = student(**batch, use_dropout=True)
-                student_view2 = student(**batch, use_dropout=True)
-                with torch.no_grad():
-                    teacher_view1 = teacher(**batch, use_dropout=False, is_teacher=True)
-                    teacher_view2 = teacher(**batch, use_dropout=False, is_teacher=True)
-            else:
-                view1, view2 = (
-                    {name: value.to(device) for name, value in view.items()} for view in batch
-                )
-                student_view1 = student(**view1, use_dropout=False)
-                student_view2 = student(**view2, use_dropout=False)
-                with torch.no_grad():
-                    teacher_view1 = teacher(**view1, use_dropout=False, is_teacher=True)
-                    teacher_view2 = teacher(**view2, use_dropout=False, is_teacher=True)
+            completed_step = global_step + 1
+            should_log = completed_step == 1 or completed_step % args.log_steps == 0
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=use_dino_bf16,
+            ):
+                if args.augmentation == "dropout":
+                    batch = {
+                        name: value.to(device, non_blocking=optimize_dino_cuda)
+                        for name, value in batch.items()
+                    }
+                    if isinstance(objective, DINOLoss):
+                        batch_size = next(iter(batch.values())).shape[0]
+                        combined_batch = {
+                            name: torch.cat((value, value), dim=0) for name, value in batch.items()
+                        }
+                        combined_student = student(**combined_batch, use_dropout=True)
+                        student_view1 = DINOOutput(
+                            embedding=combined_student.embedding[:batch_size],
+                            logits=combined_student.logits[:batch_size],
+                        )
+                        student_view2 = DINOOutput(
+                            embedding=combined_student.embedding[batch_size:],
+                            logits=combined_student.logits[batch_size:],
+                        )
+                        # The EMA teacher is in eval mode with dropout disabled, so both
+                        # global views are exactly the same for dropout augmentation.
+                        with torch.no_grad():
+                            teacher_view1 = teacher(
+                                **batch, use_dropout=False, is_teacher=True
+                            )
+                        teacher_view2 = teacher_view1
+                    else:
+                        # Keep the existing InfoNCE execution path unchanged.
+                        student_view1 = student(**batch, use_dropout=True)
+                        student_view2 = student(**batch, use_dropout=True)
+                        with torch.no_grad():
+                            teacher_view1 = teacher(
+                                **batch, use_dropout=False, is_teacher=True
+                            )
+                            teacher_view2 = teacher(
+                                **batch, use_dropout=False, is_teacher=True
+                            )
+                else:
+                    view1, view2 = (
+                        {
+                            name: value.to(device, non_blocking=optimize_dino_cuda)
+                            for name, value in view.items()
+                        }
+                        for view in batch
+                    )
+                    student_view1 = student(**view1, use_dropout=False)
+                    student_view2 = student(**view2, use_dropout=False)
+                    with torch.no_grad():
+                        teacher_view1 = teacher(**view1, use_dropout=False, is_teacher=True)
+                        teacher_view2 = teacher(**view2, use_dropout=False, is_teacher=True)
 
-            temperature = teacher_temperature(
-                global_step,
-                args.teacher_temp_warmup_steps,
-                args.warmup_teacher_temp,
-                args.teacher_temp,
-            )
-            if isinstance(objective, DINOLoss):
-                loss, loss_metrics = objective(
-                    (student_view1.logits, student_view2.logits),
-                    (teacher_view1.logits, teacher_view2.logits),
-                    temperature,
+                temperature = teacher_temperature(
+                    global_step,
+                    args.teacher_temp_warmup_steps,
+                    args.warmup_teacher_temp,
+                    args.teacher_temp,
                 )
-            else:
-                loss, loss_metrics = objective(
-                    (student_view1.embedding, student_view2.embedding)
+                if isinstance(objective, DINOLoss):
+                    loss, loss_metrics = objective(
+                        (student_view1.logits, student_view2.logits),
+                        (teacher_view1.logits, teacher_view2.logits),
+                        temperature,
+                        compute_metrics=should_log,
+                    )
+                else:
+                    loss, loss_metrics = objective(
+                        (student_view1.embedding, student_view2.embedding)
+                    )
+            if optimize_dino_cuda:
+                torch._assert_async(
+                    torch.isfinite(loss), f"Non-finite loss at step {global_step}"
                 )
-            if not torch.isfinite(loss):
+            elif not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {loss.item()}")
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), args.max_grad_norm)
@@ -504,43 +616,51 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                 momentum = cosine_teacher_momentum(
                     global_step, total_steps, args.teacher_momentum
                 )
-                update_teacher(student, teacher, momentum)
+                update_teacher(
+                    student,
+                    teacher,
+                    momentum,
+                    use_foreach=isinstance(objective, DINOLoss),
+                )
                 if isinstance(objective, DINOLoss):
                     objective.update_center((teacher_view1.logits, teacher_view2.logits))
             optimizer.zero_grad(set_to_none=True)
 
-            student_view_cosine = F.cosine_similarity(
-                student_view1.embedding.detach(), student_view2.embedding.detach()
-            ).mean()
-            teacher_view_cosine = F.cosine_similarity(
-                teacher_view1.embedding, teacher_view2.embedding
-            ).mean()
-            pairwise_cosine = off_diagonal_cosine(student_view1.embedding.detach())
-            embedding_std = student_view1.embedding.detach().std(dim=0, unbiased=False).mean()
+            if args.augmentation == "dropout" and not dropout_views_checked:
+                if torch.equal(student_view1.embedding, student_view2.embedding):
+                    warnings.warn(
+                        "Dropout views are identical; check that encoder dropout is nonzero."
+                    )
+                dropout_views_checked = True
 
-            if args.augmentation == "dropout" and not dropout_warning_emitted and (
-                torch.equal(student_view1.embedding, student_view2.embedding)
-                or torch.equal(teacher_view1.embedding, teacher_view2.embedding)
-            ):
-                warnings.warn("Dropout views are identical; check that encoder dropout is nonzero.")
-                dropout_warning_emitted = True
-            if (
-                not collapse_warning_emitted
-                and global_step >= args.collapse_warning_after
-                and (
-                    embedding_std < 1e-3
-                    or (torch.isfinite(pairwise_cosine) and pairwise_cosine > 0.99)
+            if should_log:
+                student_view_cosine = F.cosine_similarity(
+                    student_view1.embedding.detach(), student_view2.embedding.detach()
+                ).mean()
+                teacher_view_cosine = F.cosine_similarity(
+                    teacher_view1.embedding, teacher_view2.embedding
+                ).mean()
+                pairwise_cosine = off_diagonal_cosine(student_view1.embedding.detach())
+                embedding_std = (
+                    student_view1.embedding.detach().float().std(dim=0, unbiased=False).mean()
                 )
-            ):
-                warnings.warn(
-                    "Sentence embeddings show a possible collapse; inspect logged diagnostics."
-                )
-                collapse_warning_emitted = True
+                if (
+                    not collapse_warning_emitted
+                    and global_step >= args.collapse_warning_after
+                    and (
+                        embedding_std < 1e-3
+                        or (torch.isfinite(pairwise_cosine) and pairwise_cosine > 0.99)
+                    )
+                ):
+                    warnings.warn(
+                        "Sentence embeddings show a possible collapse; inspect logged diagnostics."
+                    )
+                    collapse_warning_emitted = True
 
             global_step += 1
-            if args.quiet:
+            if args.quiet and (should_log or global_step == total_steps):
                 _print_progress(global_step, total_steps)
-            if global_step == 1 or global_step % args.log_steps == 0:
+            if should_log:
                 log = {
                     "step": global_step,
                     "loss": loss.item(),
@@ -578,6 +698,11 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                     embedding2,
                     evaluation_scores,
                 )
+                max_sts_spearman = max(
+                    max_sts_spearman if max_sts_spearman is not None else -math.inf,
+                    metrics["sts_spearman"],
+                )
+                metrics = {**metrics, "max_sts_spearman": max_sts_spearman}
                 log_metrics(
                     args.output_dir,
                     {"step": global_step, **metrics},
@@ -585,6 +710,8 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
                     tensorboard_writer=tensorboard_writer,
                     namespace="eval",
                 )
+                if evaluation_callback is not None:
+                    evaluation_callback(global_step, metrics)
                 student.train()
 
             if args.save_steps and global_step % args.save_steps == 0:
@@ -610,17 +737,19 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
 
     if any(parameter.grad is not None for parameter in teacher.parameters()):
         raise RuntimeError("A gradient unexpectedly reached the teacher")
-    checkpoint = save_checkpoint(
-        Path(args.output_dir),
-        student,
-        teacher,
-        objective,
-        optimizer,
-        scheduler,
-        tokenizer,
-        args,
-        global_step,
-    )
+    checkpoint = None
+    if save_final_checkpoint:
+        checkpoint = save_checkpoint(
+            Path(args.output_dir),
+            student,
+            teacher,
+            objective,
+            optimizer,
+            scheduler,
+            tokenizer,
+            args,
+            global_step,
+        )
     if tensorboard_writer is not None:
         tensorboard_writer.close()
     return checkpoint
@@ -630,7 +759,7 @@ def train(args: SimpleNamespace, run_config: Any | None = None) -> Path:
 def main(config: DictConfig) -> None:
     args = to_train_args(config)
     checkpoint = train(args, run_config=config)
-    if not args.quiet:
+    if checkpoint is not None and not args.quiet:
         print(f"Saved checkpoint to {checkpoint}")
 
 

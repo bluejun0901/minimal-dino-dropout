@@ -97,6 +97,55 @@ def test_projection_head_can_enable_or_disable_mlp(use_mlp):
     assert torch.isfinite(output.logits).all()
 
 
+def test_teacher_head_uses_configured_uniformity_step_size(monkeypatch):
+    model = SentenceDINO(
+        TinyEncoder(dropout=0.0),
+        output_dim=16,
+        uniformity_step_size=0.05,
+    ).eval()
+    captured = {}
+
+    def record_uniformization(embedding, step_size):
+        captured["step_size"] = step_size
+        return embedding
+
+    monkeypatch.setattr(model.head, "uniformize_embedding", record_uniformization)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        "attention_mask": torch.ones(2, 3, dtype=torch.long),
+    }
+
+    model(**batch, use_dropout=False, is_teacher=True)
+
+    assert captured["step_size"] == 0.05
+
+
+def test_zero_uniformity_step_size_disables_teacher_adjustment(monkeypatch):
+    model = SentenceDINO(
+        TinyEncoder(dropout=0.0),
+        output_dim=16,
+        uniformity_step_size=0.0,
+    ).eval()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("uniformization must be disabled")
+
+    monkeypatch.setattr(model.head, "uniformize_embedding", fail_if_called)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        "attention_mask": torch.ones(2, 3, dtype=torch.long),
+    }
+
+    output = model(**batch, use_dropout=False, is_teacher=True)
+
+    assert torch.isfinite(output.logits).all()
+
+
+def test_sentence_dino_rejects_negative_uniformity_step_size():
+    with pytest.raises(ValueError, match="uniformity_step_size"):
+        SentenceDINO(TinyEncoder(), uniformity_step_size=-0.01)
+
+
 def test_sentence_dino_rejects_invalid_pooling():
     with pytest.raises(ValueError, match="pooling"):
         SentenceDINO(TinyEncoder(), pooling="max")

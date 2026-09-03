@@ -84,6 +84,11 @@ top-level defaults are split into `data`, `model`, `augmentation`, `objective`, 
 `augmentation=word`. Hydra saves the composed YAML to
 `<runtime.output_dir>/.hydra/config.yaml`; the run also keeps its JSON reproduction artifact.
 
+The DINO path uses BF16 encoder and projection-head computation on BF16-capable CUDA devices by
+default, while keeping its temperature-scaled softmaxes in FP32. This is suitable for Ampere GPUs
+such as the RTX A6000. Set `runtime.dino_precision=fp32` to disable mixed precision. The InfoNCE
+path remains FP32 regardless of this setting.
+
 The default uses mean pooling and applies the normalized output layer directly to the pooled BERT
 representation. Set `model.pooling=cls` to use the first token instead, and set
 `model.use_mlp=true` to enable the `2048 -> 2048 -> 256` projection MLP before the output layer.
@@ -238,6 +243,39 @@ are written below `runs/sweeps-v2`; `OUTPUT_ROOT`, `TRAIN_FILE`, and `DEVICE` ca
 locations or the device. Additional Hydra overrides are forwarded after the sweep name, for
 example `scripts/sweep_hyperparameters.sh dropout optimization.max_steps=100` for a smoke run.
 The grids are defined near the top of the script.
+
+## 8. Tune DINO + dropout with Optuna
+
+The Optuna tuner fixes the experiment to `objective=dino` and `augmentation=dropout`, maximizes
+the best STS-B validation Spearman score observed so far, and prunes weak trials at intermediate
+evaluations. Every evaluation logs both `sts_spearman` and its running maximum
+`max_sts_spearman`; resumed runs preserve the maximum from their existing metrics log.
+It searches learning rate, batch size, weight decay, warmup ratio, encoder dropout, MLP use,
+teacher uniformization step size, student and teacher temperatures, center momentum, and
+teacher EMA momentum. It also searches DINO reset intervals over `null`, `150`, `300`, and `600`
+completed optimizer steps. A zero uniformization step size disables that teacher-head adjustment.
+Study state is stored in SQLite, so rerunning the same command resumes the study. Trial runs keep
+metrics and reproduction artifacts but skip their large final checkpoints; retrain the best
+parameters to produce a checkpoint.
+
+For a short initial study:
+
+```bash
+source .venv/bin/activate
+CUDA_VISIBLE_DEVICES=0 uv run python -m minimal_dino.tune \
+  --n-trials 20 \
+  --output-root runs/optuna/dino-dropout \
+  data.train_file=data/wiki1m_for_simcse.txt \
+  optimization.max_steps=2000 \
+  evaluation.steps=250 \
+  runtime.device=cuda
+```
+
+Every trial must reach at least one evaluation after step 0. In particular,
+`evaluation.steps` must not exceed `optimization.max_steps` for step-limited studies. The best
+score, parameters, ready-to-copy Hydra overrides, and trial directory are written to
+`<output-root>/best_trial.json`. Fixed Hydra overrides may be appended to the command, but values
+owned by the search space cannot be overridden.
 
 For a quick implementation check:
 

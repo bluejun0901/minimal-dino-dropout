@@ -39,6 +39,34 @@ def test_center_uses_raw_teacher_logits_after_loss():
     assert torch.equal(objective.center, torch.tensor([[0.5, 0.5]]))
 
 
+def test_dino_can_skip_diagnostics_without_changing_loss():
+    objective = DINOLoss(output_dim=3, student_temp=0.2)
+    student = (torch.randn(2, 3), torch.randn(2, 3))
+    teacher = (torch.randn(2, 3), torch.randn(2, 3))
+
+    expected, metrics = objective(student, teacher, teacher_temp=0.1)
+    actual, skipped_metrics = objective(
+        student, teacher, teacher_temp=0.1, compute_metrics=False
+    )
+
+    assert torch.equal(actual, expected)
+    assert metrics
+    assert skipped_metrics == {}
+
+
+def test_dino_reuses_shared_teacher_view_for_loss_and_center():
+    objective = DINOLoss(output_dim=3, student_temp=0.2, center_momentum=0.5)
+    student = (torch.randn(2, 3), torch.randn(2, 3))
+    teacher = torch.randn(2, 3)
+
+    shared_loss, _ = objective(student, (teacher, teacher), teacher_temp=0.1)
+    copied_loss, _ = objective(student, (teacher, teacher.clone()), teacher_temp=0.1)
+    objective.update_center((teacher, teacher))
+
+    assert torch.equal(shared_loss, copied_loss)
+    assert torch.allclose(objective.center, teacher.mean(dim=0, keepdim=True) * 0.5)
+
+
 def test_infonce_uses_diagonal_pairs_in_both_directions():
     objective = InfoNCELoss(temperature=0.2)
     view1 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)

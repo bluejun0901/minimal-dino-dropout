@@ -32,10 +32,19 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         raise ValueError("model.pooling must be 'cls' or 'mean'")
     if not isinstance(model["use_mlp"], bool):
         raise ValueError("model.use_mlp must be a boolean")
+    if (
+        isinstance(model["uniformity_step_size"], bool)
+        or not isinstance(model["uniformity_step_size"], (int, float))
+        or model["uniformity_step_size"] < 0
+    ):
+        raise ValueError("model.uniformity_step_size must be a non-negative number")
 
     device = runtime["device"]
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    dino_precision = runtime.get("dino_precision", "bf16")
+    if dino_precision not in {"fp32", "bf16"}:
+        raise ValueError("runtime.dino_precision must be 'fp32' or 'bf16'")
 
     return SimpleNamespace(
         train_file=data["train_file"],
@@ -50,6 +59,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         output_dim=model["output_dim"],
         head_hidden_dim=model["head_hidden_dim"],
         bottleneck_dim=model["bottleneck_dim"],
+        uniformity_step_size=model["uniformity_step_size"],
         augmentation=augmentation["name"],
         augmentation_strength=augmentation["strength"],
         objective=objective["name"],
@@ -79,6 +89,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         output_dir=runtime["output_dir"],
         seed=runtime["seed"],
         device=device,
+        dino_precision=dino_precision,
         log_steps=logging["steps"],
         quiet=logging["quiet"],
         tensorboard=logging["tensorboard"],

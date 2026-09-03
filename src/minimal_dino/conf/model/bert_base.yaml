@@ -7,3 +7,4 @@ use_mlp: true
 output_dim: 65536
 head_hidden_dim: 2048
 bottleneck_dim: 256
+uniformity_step_size: 0.01

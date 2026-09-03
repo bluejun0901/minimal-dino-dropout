@@ -8,7 +8,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoConfig, AutoModel
-
+from transformers.utils import logging as transformers_logging
+transformers_logging.set_verbosity_error()
 
 @contextmanager
 def dropout_mode(module: nn.Module, enabled: bool):
@@ -61,15 +62,19 @@ class DINOHead(nn.Module):
         hidden_dim: int = 2_048,
         bottleneck_dim: int = 256,
         use_mlp: bool = True,
+        uniformity_step_size: float = 0.01,
     ) -> None:
         super().__init__()
         if not isinstance(use_mlp, bool):
             raise ValueError("use_mlp must be a boolean")
+        if uniformity_step_size < 0:
+            raise ValueError("uniformity_step_size must be non-negative")
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
         self.bottleneck_dim = bottleneck_dim
         self.use_mlp = use_mlp
+        self.uniformity_step_size = uniformity_step_size
         if use_mlp:
             self.mlp = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
@@ -107,16 +112,22 @@ class DINOHead(nn.Module):
         return grad
 
     def uniformize_embedding(
-        self, embedding: torch.Tensor, step_size: float = 0.01
+        self, embedding: torch.Tensor, step_size: float
     ) -> torch.Tensor:
-        grad = self.uniformity_grad(embedding)
-        return F.normalize(embedding - step_size * grad, dim=-1)
+        normalized_embedding = F.normalize(embedding, dim=-1)
+        embedding_norm = embedding.norm(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(normalized_embedding.dtype).tiny
+        )
+        grad = self.uniformity_grad(normalized_embedding, t=2.0)
+        return F.normalize(normalized_embedding - step_size * grad, dim=-1) * embedding_norm
 
     def forward(self, embedding: torch.Tensor, is_teacher: bool = False) -> torch.Tensor:
         projection = F.normalize(self.mlp(embedding), dim=-1)
         weight = F.normalize(self.last_weight, dim=-1)
-        if not self.training and is_teacher:
-            projection = self.uniformize_embedding(projection, step_size=0.01)
+        if not self.training and is_teacher and self.uniformity_step_size > 0:
+            projection = self.uniformize_embedding(
+                projection.float(), step_size=self.uniformity_step_size
+            ).to(projection.dtype)
 
         return F.linear(projection, weight)
 
@@ -138,6 +149,7 @@ class SentenceDINO(nn.Module):
         bottleneck_dim: int = 256,
         pooling: str = "mean",
         use_mlp: bool = True,
+        uniformity_step_size: float = 0.01,
     ) -> None:
         super().__init__()
         if pooling not in {"cls", "mean"}:
@@ -152,6 +164,7 @@ class SentenceDINO(nn.Module):
             head_hidden_dim,
             bottleneck_dim,
             use_mlp=use_mlp,
+            uniformity_step_size=uniformity_step_size,
         )
 
     @classmethod
@@ -235,6 +248,7 @@ def model_config(model: SentenceDINO) -> dict[str, Any]:
         "bottleneck_dim": model.head.bottleneck_dim,
         "pooling": model.pooling,
         "use_mlp": model.use_mlp,
+        "uniformity_step_size": model.head.uniformity_step_size,
     }
 
 
@@ -248,4 +262,5 @@ def checkpoint_model_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     )
     config.setdefault("head_hidden_dim", 2_048)
     config.setdefault("bottleneck_dim", 256)
+    config.setdefault("uniformity_step_size", 0.01)
     return config
