@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 from minimal_dino.data import TokenizeCollator
-from minimal_dino.model import SentenceDINO, checkpoint_model_config
+from minimal_dino.model import SentenceBYOL, checkpoint_model_config
 
 
 def load_stsb_split(data_dir: str | Path, split: str) -> Any:
@@ -31,7 +31,7 @@ def load_stsb_split(data_dir: str | Path, split: str) -> Any:
 
 @torch.inference_mode()
 def encode_sentences(
-    model: SentenceDINO,
+    model: SentenceBYOL,
     tokenizer: Any,
     sentences: list[str],
     *,
@@ -84,7 +84,7 @@ def embedding_diagnostics(
 
 
 def encode_stsb_dataset(
-    model: SentenceDINO,
+    model: SentenceBYOL,
     tokenizer: Any,
     dataset: Any,
     *,
@@ -141,7 +141,7 @@ def stsb_metrics(
 
 
 def evaluate_stsb(
-    model: SentenceDINO,
+    model: SentenceBYOL,
     tokenizer: Any,
     dataset: Any,
     *,
@@ -160,14 +160,14 @@ def evaluate_stsb(
     return stsb_metrics(embedding1, embedding2, scores)
 
 
-def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceDINO, Any]:
+def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceBYOL, Any]:
     path = Path(path)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     config_dict = dict(checkpoint["encoder_config"])
     model_type = config_dict.pop("model_type")
     encoder_config = AutoConfig.for_model(model_type, **config_dict)
     encoder = AutoModel.from_config(encoder_config)
-    model = SentenceDINO(encoder, **checkpoint_model_config(checkpoint))
+    model = SentenceBYOL(encoder, **checkpoint_model_config(checkpoint))
     model.load_state_dict(checkpoint["student"])
     model.to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(path.parent / "tokenizer")
@@ -175,7 +175,7 @@ def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceDIN
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a minimal DINO checkpoint on STS-B")
+    parser = argparse.ArgumentParser(description="Evaluate a minimal BYOL checkpoint on STS-B")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", default="validation", choices=("validation", "test"))
     parser.add_argument("--stsb-dir", default="data/stsb")

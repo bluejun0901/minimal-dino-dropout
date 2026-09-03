@@ -1,1 +1,1 @@
-"""Hydra configuration package for minimal DINO training."""
+"""Hydra configuration package for minimal BYOL training."""

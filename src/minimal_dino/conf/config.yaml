@@ -2,7 +2,7 @@ defaults:
   - data: default
   - model: bert_base
   - augmentation: dropout
-  - objective: dino
+  - objective: byol
   - optimization: default
   - teacher: default
   - evaluation: stsb

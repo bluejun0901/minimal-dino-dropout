@@ -6,165 +6,120 @@ from typing import Any, Mapping
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 from transformers import AutoConfig, AutoModel
 from transformers.utils import logging as transformers_logging
+
 transformers_logging.set_verbosity_error()
 
+
 @contextmanager
-def dropout_mode(module: nn.Module, enabled: bool):
-    """Temporarily control only dropout modules, independent of model train/eval mode."""
+def dropout_mode(
+    module: nn.Module,
+    enabled: bool,
+    probability: float | None = None,
+):
+    """Temporarily control dropout state and probability independently of model mode."""
+    if probability is not None and not 0.0 <= probability < 1.0:
+        raise ValueError("dropout probability must be in [0, 1)")
     dropouts = [child for child in module.modules() if isinstance(child, nn.Dropout)]
-    previous = [child.training for child in dropouts]
+    previous = [(child.training, child.p) for child in dropouts]
     for child in dropouts:
         child.train(enabled)
+        if probability is not None:
+            child.p = probability
     try:
         yield
     finally:
-        for child, was_training in zip(dropouts, previous):
+        for child, (was_training, previous_probability) in zip(dropouts, previous):
             child.train(was_training)
+            child.p = previous_probability
 
 
-class UniformityLoss(nn.Module):
-    def __init__(self, t: float = 2.0):
-        super().__init__()
-        if t <= 0:
-            raise ValueError("t must be positive")
-        self.t = t
+class BYOLHead(nn.Module):
+    """BYOL projector and online predictor.
 
-    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
-        if embeddings.shape[0] < 2:
-            return embeddings.sum() * 0.0
-        embeddings = F.normalize(embeddings, dim=-1)
-        similarity_matrix = embeddings @ embeddings.T
-        # Exclude diagonal elements (self-similarity) from the loss.
-        mask = ~torch.eye(
-            similarity_matrix.shape[0],
-            dtype=torch.bool,
-            device=similarity_matrix.device,
-        )
-        similarity_matrix = similarity_matrix[mask].view(similarity_matrix.shape[0], -1)
-        distance_square_matrix = 2 - 2 * similarity_matrix
-        return torch.logsumexp(-distance_square_matrix * self.t, dim=-1).mean()
-
-
-class DINOHead(nn.Module):
-    """The BN-free three-layer projection head used by DINO.
-
-    The final linear layer uses unit-normalized weight vectors. This is equivalent to
-    DINO's weight-normalized layer with its scale fixed to one (``norm_last_layer=True``).
+    LayerNorm replaces BYOL's batch normalization so sentence training also supports a
+    singleton final minibatch. The target branch uses only :meth:`project`; its predictor
+    parameters are never part of the regression target.
     """
 
     def __init__(
         self,
         input_dim: int,
-        output_dim: int = 65_536,
-        hidden_dim: int = 2_048,
-        bottleneck_dim: int = 256,
-        use_mlp: bool = True,
-        uniformity_step_size: float = 0.01,
+        projection_dim: int = 256,
+        projector_hidden_dim: int = 4_096,
+        predictor_hidden_dim: int = 4_096,
     ) -> None:
         super().__init__()
-        if not isinstance(use_mlp, bool):
-            raise ValueError("use_mlp must be a boolean")
-        if uniformity_step_size < 0:
-            raise ValueError("uniformity_step_size must be non-negative")
+        for name, value in {
+            "projection_dim": projection_dim,
+            "projector_hidden_dim": projector_hidden_dim,
+            "predictor_hidden_dim": predictor_hidden_dim,
+        }.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+
         self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
-        self.bottleneck_dim = bottleneck_dim
-        self.use_mlp = use_mlp
-        self.uniformity_step_size = uniformity_step_size
-        if use_mlp:
-            self.mlp = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, bottleneck_dim),
-            )
-            projection_dim = bottleneck_dim
-        else:
-            self.mlp = nn.Identity()
-            projection_dim = input_dim
-        self.last_weight = nn.Parameter(torch.empty(output_dim, projection_dim))
+        self.projection_dim = projection_dim
+        self.projector_hidden_dim = projector_hidden_dim
+        self.predictor_hidden_dim = predictor_hidden_dim
+        self.projector = self._mlp(input_dim, projector_hidden_dim, projection_dim)
+        self.predictor = self._mlp(projection_dim, predictor_hidden_dim, projection_dim)
         self.reset_parameters()
 
+    @staticmethod
+    def _mlp(input_dim: int, hidden_dim: int, output_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
     def reset_parameters(self) -> None:
-        for layer in self.mlp.modules():
-            if isinstance(layer, nn.Linear):
-                nn.init.trunc_normal_(layer.weight, std=0.02)
-                nn.init.zeros_(layer.bias)
-        nn.init.trunc_normal_(self.last_weight, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
-    def uniformity_grad(self, z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
-        if z.shape[0] < 2:
-            return torch.zeros_like(z)
-        diff = z[:, None, :] - z[None, :, :]
-        dist2 = diff.square().sum(dim=-1)
-        weight = torch.exp(-t * dist2)
-        mask = ~torch.eye(z.shape[0], dtype=torch.bool, device=z.device)
-        weight = weight * mask
-        denominator = weight.sum() / 2
-        grad = -2 * t * (weight[..., None] * diff).sum(dim=1) / denominator.clamp_min(
-            torch.finfo(z.dtype).tiny
-        )
-        return grad
+    def project(self, embedding: torch.Tensor) -> torch.Tensor:
+        return self.projector(embedding)
 
-    def uniformize_embedding(
-        self, embedding: torch.Tensor, step_size: float
-    ) -> torch.Tensor:
-        normalized_embedding = F.normalize(embedding, dim=-1)
-        embedding_norm = embedding.norm(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(normalized_embedding.dtype).tiny
-        )
-        grad = self.uniformity_grad(normalized_embedding, t=2.0)
-        return F.normalize(normalized_embedding - step_size * grad, dim=-1) * embedding_norm
-
-    def forward(self, embedding: torch.Tensor, is_teacher: bool = False) -> torch.Tensor:
-        projection = F.normalize(self.mlp(embedding), dim=-1)
-        weight = F.normalize(self.last_weight, dim=-1)
-        if not self.training and is_teacher and self.uniformity_step_size > 0:
-            projection = self.uniformize_embedding(
-                projection.float(), step_size=self.uniformity_step_size
-            ).to(projection.dtype)
-
-        return F.linear(projection, weight)
+    def predict(self, projection: torch.Tensor) -> torch.Tensor:
+        return self.predictor(projection)
 
 
 @dataclass
-class DINOOutput:
+class BYOLOutput:
     embedding: torch.Tensor
-    logits: torch.Tensor
+    projection: torch.Tensor
+    prediction: torch.Tensor | None
 
 
-class SentenceDINO(nn.Module):
-    """Configurable BERT sentence pooling followed by a DINO projection head."""
+class SentenceBYOL(nn.Module):
+    """Sentence encoder followed by a BYOL projector and online predictor."""
 
     def __init__(
         self,
         encoder: nn.Module,
-        output_dim: int = 65_536,
-        head_hidden_dim: int = 2_048,
-        bottleneck_dim: int = 256,
+        projection_dim: int = 256,
+        projector_hidden_dim: int = 4_096,
+        predictor_hidden_dim: int = 4_096,
         pooling: str = "mean",
-        use_mlp: bool = True,
-        uniformity_step_size: float = 0.01,
     ) -> None:
         super().__init__()
         if pooling not in {"cls", "mean"}:
             raise ValueError("pooling must be 'cls' or 'mean'")
         self.encoder = encoder
         self.pooling = pooling
-        self.use_mlp = use_mlp
-        hidden_size = encoder.config.hidden_size
-        self.head = DINOHead(
-            hidden_size,
-            output_dim,
-            head_hidden_dim,
-            bottleneck_dim,
-            use_mlp=use_mlp,
-            uniformity_step_size=uniformity_step_size,
+        self.head = BYOLHead(
+            encoder.config.hidden_size,
+            projection_dim=projection_dim,
+            projector_hidden_dim=projector_hidden_dim,
+            predictor_hidden_dim=predictor_hidden_dim,
         )
 
     @classmethod
@@ -175,18 +130,10 @@ class SentenceDINO(nn.Module):
         revision: str | None = None,
         dropout: float | None = None,
         **head_kwargs: Any,
-    ) -> SentenceDINO:
-        model_kwargs = {}
-        if dropout is not None:
-            if not 0.0 <= dropout < 1.0:
-                raise ValueError("dropout must be in [0, 1)")
-            # BERT uses separate dropout probabilities for hidden states and attention.
-            # Keep them tied so one sweep value describes the complete encoder setup.
-            model_kwargs.update(
-                hidden_dropout_prob=dropout,
-                attention_probs_dropout_prob=dropout,
-            )
-        encoder = AutoModel.from_pretrained(model_name, revision=revision, **model_kwargs)
+    ) -> SentenceBYOL:
+        encoder = AutoModel.from_pretrained(
+            model_name, revision=revision, **cls._dropout_kwargs(dropout)
+        )
         return cls(encoder, **head_kwargs)
 
     @classmethod
@@ -197,19 +144,23 @@ class SentenceDINO(nn.Module):
         revision: str | None = None,
         dropout: float | None = None,
         **head_kwargs: Any,
-    ) -> SentenceDINO:
+    ) -> SentenceBYOL:
         """Build the requested encoder architecture without loading pretrained weights."""
-        config_kwargs = {}
-        if dropout is not None:
-            if not 0.0 <= dropout < 1.0:
-                raise ValueError("dropout must be in [0, 1)")
-            config_kwargs.update(
-                hidden_dropout_prob=dropout,
-                attention_probs_dropout_prob=dropout,
-            )
-        config = AutoConfig.from_pretrained(model_name, revision=revision, **config_kwargs)
-        encoder = AutoModel.from_config(config)
-        return cls(encoder, **head_kwargs)
+        config = AutoConfig.from_pretrained(
+            model_name, revision=revision, **cls._dropout_kwargs(dropout)
+        )
+        return cls(AutoModel.from_config(config), **head_kwargs)
+
+    @staticmethod
+    def _dropout_kwargs(dropout: float | None) -> dict[str, float]:
+        if dropout is None:
+            return {}
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        return {
+            "hidden_dropout_prob": dropout,
+            "attention_probs_dropout_prob": dropout,
+        }
 
     def forward(
         self,
@@ -217,11 +168,12 @@ class SentenceDINO(nn.Module):
         attention_mask: torch.Tensor,
         *,
         use_dropout: bool,
-        is_teacher: bool = False,
-    ) -> DINOOutput:
-        # Calling the same encoder twice gives independent masks. The context is needed
-        # for the EMA teacher, which otherwise stays in eval mode and disables dropout.
-        with dropout_mode(self.encoder, use_dropout):
+        dropout_probability: float | None = None,
+        target: bool = False,
+        center: torch.Tensor | None = None,
+        center_scale: float = 0.5,
+    ) -> BYOLOutput:
+        with dropout_mode(self.encoder, use_dropout, dropout_probability):
             hidden = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -232,35 +184,35 @@ class SentenceDINO(nn.Module):
         else:
             mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
             embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        logits = self.head(embedding, is_teacher=is_teacher)
-        return DINOOutput(embedding=embedding, logits=logits)
+        if center is not None:
+            if not target:
+                raise ValueError("center can only be applied to the target branch")
+            if center.shape != (1, self.head.input_dim):
+                raise ValueError(
+                    f"center must have shape (1, {self.head.input_dim}), got {tuple(center.shape)}"
+                )
+            projection_input = embedding.float() - center * center_scale
+        else:
+            projection_input = embedding
+        projection = self.head.project(projection_input)
+        prediction = None if target else self.head.predict(projection)
+        return BYOLOutput(embedding, projection, prediction)
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Return the configured pre-projection sentence representation without dropout."""
-        return self(input_ids, attention_mask, use_dropout=False, is_teacher=False).embedding
+        return self(input_ids, attention_mask, use_dropout=False, target=True).embedding
 
 
-def model_config(model: SentenceDINO) -> dict[str, Any]:
+def model_config(model: SentenceBYOL) -> dict[str, Any]:
     """Return the architecture choices needed to reconstruct a sentence model."""
     return {
-        "output_dim": model.head.output_dim,
-        "head_hidden_dim": model.head.hidden_dim,
-        "bottleneck_dim": model.head.bottleneck_dim,
+        "projection_dim": model.head.projection_dim,
+        "projector_hidden_dim": model.head.projector_hidden_dim,
+        "predictor_hidden_dim": model.head.predictor_hidden_dim,
         "pooling": model.pooling,
-        "use_mlp": model.use_mlp,
-        "uniformity_step_size": model.head.uniformity_step_size,
     }
 
 
 def checkpoint_model_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
-    """Read model choices, including checkpoints created before explicit switches."""
-    config = dict(checkpoint["head_config"])
-    student_state = checkpoint["student"]
-    config.setdefault("pooling", checkpoint.get("pooling", "mean"))
-    config.setdefault(
-        "use_mlp", any(name.startswith("head.mlp.") for name in student_state)
-    )
-    config.setdefault("head_hidden_dim", 2_048)
-    config.setdefault("bottleneck_dim", 256)
-    config.setdefault("uniformity_step_size", 0.01)
-    return config
+    """Read the BYOL model configuration from a checkpoint."""
+    return dict(checkpoint["head_config"])

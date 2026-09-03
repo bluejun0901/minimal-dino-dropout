@@ -26,25 +26,51 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
 
     if augmentation["name"] not in {"dropout", "word"}:
         raise ValueError("augmentation.name must be 'dropout' or 'word'")
-    if objective["name"] not in {"dino", "infonce"}:
-        raise ValueError("objective.name must be 'dino' or 'infonce'")
+    if objective["name"] not in {"byol", "infonce"}:
+        raise ValueError("objective.name must be 'byol' or 'infonce'")
     if model["pooling"] not in {"cls", "mean"}:
         raise ValueError("model.pooling must be 'cls' or 'mean'")
-    if not isinstance(model["use_mlp"], bool):
-        raise ValueError("model.use_mlp must be a boolean")
+    for name in ("projection_dim", "projector_hidden_dim", "predictor_hidden_dim"):
+        value = model[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"model.{name} must be a positive integer")
+    encoder_freeze_steps = optimization["encoder_freeze_steps"]
     if (
-        isinstance(model["uniformity_step_size"], bool)
-        or not isinstance(model["uniformity_step_size"], (int, float))
-        or model["uniformity_step_size"] < 0
+        isinstance(encoder_freeze_steps, bool)
+        or not isinstance(encoder_freeze_steps, int)
+        or encoder_freeze_steps < 0
     ):
-        raise ValueError("model.uniformity_step_size must be a non-negative number")
+        raise ValueError("optimization.encoder_freeze_steps must be a non-negative integer")
+    for name in ("encoder_learning_rate", "head_learning_rate"):
+        value = optimization[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"optimization.{name} must be positive")
+    target_dropout = teacher["dropout"]
+    if not isinstance(target_dropout, (int, float)) or isinstance(target_dropout, bool):
+        raise ValueError("teacher.dropout must be a number")
+    if not 0.0 < target_dropout < model["dropout"]:
+        raise ValueError("teacher.dropout must be positive and lower than model.dropout")
+    center_momentum = objective.get("center_momentum", 0.9)
+    if (
+        isinstance(center_momentum, bool)
+        or not isinstance(center_momentum, (int, float))
+        or not 0.0 <= center_momentum < 1.0
+    ):
+        raise ValueError("objective.center_momentum must be in [0, 1)")
+    center_scale = objective.get("center_scale", 0.5)
+    if (
+        isinstance(center_scale, bool)
+        or not isinstance(center_scale, (int, float))
+        or center_scale < 0.0
+    ):
+        raise ValueError("objective.center_scale must be a non-negative number")
 
     device = runtime["device"]
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    dino_precision = runtime.get("dino_precision", "bf16")
-    if dino_precision not in {"fp32", "bf16"}:
-        raise ValueError("runtime.dino_precision must be 'fp32' or 'bf16'")
+    byol_precision = runtime["byol_precision"]
+    if byol_precision not in {"fp32", "bf16"}:
+        raise ValueError("runtime.byol_precision must be 'fp32' or 'bf16'")
 
     return SimpleNamespace(
         train_file=data["train_file"],
@@ -55,28 +81,25 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         random_init=model["random_init"],
         dropout=model["dropout"],
         pooling=model["pooling"],
-        use_mlp=model["use_mlp"],
-        output_dim=model["output_dim"],
-        head_hidden_dim=model["head_hidden_dim"],
-        bottleneck_dim=model["bottleneck_dim"],
-        uniformity_step_size=model["uniformity_step_size"],
+        projection_dim=model["projection_dim"],
+        projector_hidden_dim=model["projector_hidden_dim"],
+        predictor_hidden_dim=model["predictor_hidden_dim"],
         augmentation=augmentation["name"],
         augmentation_strength=augmentation["strength"],
         objective=objective["name"],
-        student_temp=objective.get("student_temp", 0.1),
-        center_momentum=objective.get("center_momentum", 0.9),
-        dino_reset_interval=objective.get("reset_interval"),
+        center_momentum=center_momentum,
+        center_scale=center_scale,
         infonce_temp=objective.get("temperature", 0.05),
         epochs=optimization["epochs"],
         max_steps=optimization["max_steps"],
         batch_size=optimization["batch_size"],
-        learning_rate=optimization["learning_rate"],
+        encoder_learning_rate=optimization["encoder_learning_rate"],
+        head_learning_rate=optimization["head_learning_rate"],
+        encoder_freeze_steps=encoder_freeze_steps,
         weight_decay=optimization["weight_decay"],
         warmup_ratio=optimization["warmup_ratio"],
         max_grad_norm=optimization["max_grad_norm"],
-        teacher_temp=teacher["temperature"],
-        warmup_teacher_temp=teacher["warmup_temperature"],
-        teacher_temp_warmup_steps=teacher["temperature_warmup_steps"],
+        target_dropout=target_dropout,
         teacher_momentum=teacher["momentum"],
         eval_steps=evaluation["steps"],
         eval_batch_size=evaluation["batch_size"],
@@ -89,7 +112,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         output_dir=runtime["output_dir"],
         seed=runtime["seed"],
         device=device,
-        dino_precision=dino_precision,
+        byol_precision=byol_precision,
         log_steps=logging["steps"],
         quiet=logging["quiet"],
         tensorboard=logging["tensorboard"],

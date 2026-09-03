@@ -15,15 +15,15 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 if [[ "${SWEEP}" != "all" && "${SWEEP}" != "dropout" \
-  && "${SWEEP}" != "center-momentum" && "${SWEEP}" != "teacher-momentum" ]]; then
-  echo "Usage: $0 [all|dropout|center-momentum|teacher-momentum] [extra train args...]" >&2
+  && "${SWEEP}" != "projection-dim" && "${SWEEP}" != "teacher-momentum" ]]; then
+  echo "Usage: $0 [all|dropout|projection-dim|teacher-momentum] [extra train args...]" >&2
   exit 2
 fi
 
 # Edit these grids to change the sweep. Each run changes only the named value;
 # all other hyperparameters remain at the current baseline below.
 DROPOUT_VALUES=(0.05 0.1 0.2 0.3)
-CENTER_MOMENTUM_VALUES=(0.5 0.9 0.99 0.999)
+PROJECTION_DIM_VALUES=(128 256 512)
 TEACHER_MOMENTUM_VALUES=(0.9 0.99 0.996 0.999)
 
 TRAIN_FILE="${TRAIN_FILE:-data/wiki1m_for_simcse.txt}"
@@ -42,7 +42,8 @@ COMMON_ARGS=(
   optimization.epochs=1
   optimization.batch_size=64
   data.max_length=512
-  optimization.learning_rate=3e-5
+  optimization.encoder_learning_rate=1e-5
+  optimization.head_learning_rate=1e-4
   runtime.seed=42
   logging.steps=10
   evaluation.steps=250
@@ -69,7 +70,7 @@ run_experiment() {
     "${COMMON_ARGS[@]}" \
     "runtime.output_dir=${output_dir}" \
     model.dropout=0.1 \
-    objective.center_momentum=0.9 \
+    model.projection_dim=256 \
     teacher.momentum=0.996 \
     "${varied_key}=${value}"
 }
@@ -80,9 +81,9 @@ if [[ "${SWEEP}" == "all" || "${SWEEP}" == "dropout" ]]; then
   done
 fi
 
-if [[ "${SWEEP}" == "all" || "${SWEEP}" == "center-momentum" ]]; then
-  for value in "${CENTER_MOMENTUM_VALUES[@]}"; do
-    run_experiment center-momentum "${value}" objective.center_momentum
+if [[ "${SWEEP}" == "all" || "${SWEEP}" == "projection-dim" ]]; then
+  for value in "${PROJECTION_DIM_VALUES[@]}"; do
+    run_experiment projection-dim "${value}" model.projection_dim
   done
 fi
 

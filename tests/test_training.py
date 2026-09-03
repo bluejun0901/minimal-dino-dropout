@@ -8,21 +8,20 @@ import torch
 from hydra import compose, initialize_config_module
 from torch import nn
 
-from minimal_dino.model import SentenceDINO
-from minimal_dino.objective import DINOLoss
+from minimal_dino.model import SentenceBYOL
+from minimal_dino.objective import BYOLLoss
 from minimal_dino.train import (
     DEFAULT_MODEL_REVISION,
     _print_progress,
     cosine_teacher_momentum,
-    is_dino_reset_step,
     load_max_logged_metric,
     log_metrics,
     remove_old_periodic_checkpoints,
-    reset_dino_state,
     resolve_model_revision,
     restore_checkpoint,
     save_checkpoint,
     save_run_artifacts,
+    set_encoder_trainable,
     update_teacher,
 )
 
@@ -47,9 +46,11 @@ class TinyEncoder(nn.Module):
 
 def test_one_step_smoke_has_student_gradients_no_teacher_gradients_and_ema():
     torch.manual_seed(2)
-    student = SentenceDINO(TinyEncoder(), output_dim=12, head_hidden_dim=16, bottleneck_dim=4)
+    student = SentenceBYOL(
+        TinyEncoder(), projection_dim=4, projector_hidden_dim=16, predictor_hidden_dim=12
+    )
     teacher = copy.deepcopy(student).eval().requires_grad_(False)
-    objective = DINOLoss(12)
+    objective = BYOLLoss(embedding_dim=8)
     optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
     batch = {
         "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
@@ -60,23 +61,22 @@ def test_one_step_smoke_has_student_gradients_no_teacher_gradients_and_ema():
     student1 = student(**batch, use_dropout=True)
     student2 = student(**batch, use_dropout=True)
     with torch.no_grad():
-        teacher1 = teacher(**batch, use_dropout=True)
-        teacher2 = teacher(**batch, use_dropout=True)
+        teacher1 = teacher(**batch, use_dropout=True, target=True, center=objective.center)
+        teacher2 = teacher(**batch, use_dropout=True, target=True, center=objective.center)
     loss, _ = objective(
-        (student1.logits, student2.logits), (teacher1.logits, teacher2.logits), 0.04
+        (student1.prediction, student2.prediction),
+        (teacher1.projection, teacher2.projection),
     )
     loss.backward()
     assert any(parameter.grad is not None for parameter in student.parameters())
     assert all(parameter.grad is None for parameter in teacher.parameters())
     optimizer.step()
     update_teacher(student, teacher, momentum=0.9)
-    objective.update_center((teacher1.logits, teacher2.logits))
 
     student_after = next(student.parameters()).detach()
     teacher_after = next(teacher.parameters()).detach()
     expected = teacher_before * 0.9 + student_after * 0.1
     assert torch.allclose(teacher_after, expected)
-    assert objective.center.norm() > 0
     assert torch.isfinite(loss)
 
 
@@ -87,37 +87,18 @@ def test_teacher_momentum_cosine_schedule_reaches_one():
     assert values == sorted(values)
 
 
-def test_reset_dino_state_reinitializes_head_copies_student_and_zeros_center():
-    student = SentenceDINO(TinyEncoder(), output_dim=12, head_hidden_dim=16, bottleneck_dim=4)
-    teacher = copy.deepcopy(student).eval().requires_grad_(False)
-    objective = DINOLoss(12)
-
-    with torch.no_grad():
-        next(student.parameters()).add_(1)
-        objective.center.fill_(2)
-    encoder_before = copy.deepcopy(student.encoder.state_dict())
-    head_before = copy.deepcopy(student.head.state_dict())
-    reset_dino_state(student, teacher, objective)
-
-    assert all(
-        torch.equal(value, encoder_before[name])
-        for name, value in student.encoder.state_dict().items()
+def test_encoder_can_be_frozen_without_freezing_byol_head():
+    model = SentenceBYOL(
+        TinyEncoder(), projection_dim=4, projector_hidden_dim=16, predictor_hidden_dim=12
     )
-    assert any(
-        not torch.equal(value, head_before[name])
-        for name, value in student.head.state_dict().items()
-    )
-    assert all(
-        torch.equal(student_value, teacher.state_dict()[name])
-        for name, student_value in student.state_dict().items()
-    )
-    assert torch.equal(objective.center, torch.zeros_like(objective.center))
-    assert all(parameter.grad is None for parameter in teacher.parameters())
 
+    set_encoder_trainable(model, False)
 
-def test_dino_reset_interval_uses_completed_steps_and_none_disables_it():
-    assert [step for step in range(1, 8) if is_dino_reset_step(step, 3)] == [3, 6]
-    assert not any(is_dino_reset_step(step, None) for step in range(1, 8))
+    assert not any(parameter.requires_grad for parameter in model.encoder.parameters())
+    assert all(parameter.requires_grad for parameter in model.head.parameters())
+
+    set_encoder_trainable(model, True)
+    assert all(parameter.requires_grad for parameter in model.encoder.parameters())
 
 
 class TinyTokenizer:
@@ -125,21 +106,20 @@ class TinyTokenizer:
         path.mkdir(parents=True, exist_ok=True)
 
 
-@pytest.mark.parametrize("pooling,use_mlp", [("mean", True), ("cls", False)])
-def test_checkpoint_round_trip_restores_models_optimizer_center_and_rng(
-    tmp_path, pooling, use_mlp
+@pytest.mark.parametrize("pooling", ["mean", "cls"])
+def test_checkpoint_round_trip_restores_models_optimizer_objective_and_rng(
+    tmp_path, pooling
 ):
     torch.manual_seed(7)
-    student = SentenceDINO(
+    student = SentenceBYOL(
         TinyEncoder(),
-        output_dim=12,
-        head_hidden_dim=16,
-        bottleneck_dim=4,
+        projection_dim=4,
+        projector_hidden_dim=16,
+        predictor_hidden_dim=12,
         pooling=pooling,
-        use_mlp=use_mlp,
     )
     teacher = copy.deepcopy(student).eval().requires_grad_(False)
-    objective = DINOLoss(12)
+    objective = BYOLLoss(embedding_dim=8)
     optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     original_student = copy.deepcopy(student.state_dict())
@@ -151,7 +131,7 @@ def test_checkpoint_round_trip_restores_models_optimizer_center_and_rng(
         optimizer,
         scheduler,
         TinyTokenizer(),
-        SimpleNamespace(seed=7),
+        SimpleNamespace(seed=7, objective="byol"),
         step=3,
         checkpoint_name="checkpoint-step-3.pt",
     )
@@ -159,7 +139,7 @@ def test_checkpoint_round_trip_restores_models_optimizer_center_and_rng(
 
     with torch.no_grad():
         next(student.parameters()).add_(10)
-        objective.center.add_(1)
+        objective.center.fill_(10)
     step = restore_checkpoint(
         checkpoint, student, teacher, objective, optimizer, scheduler, torch.device("cpu")
     )
@@ -275,17 +255,27 @@ def test_progress_bar_finishes_with_newline(capsys):
 
 
 def test_save_run_artifacts_records_config_and_dirty_git_state(tmp_path, monkeypatch):
+    commands = []
     outputs = iter(
         [
             str(tmp_path) + "\n",
             "0123456789abcdef0123456789abcdef01234567\n",
             " M src/minimal_dino/train.py\n?? notes.txt\n",
             "diff --git a/file b/file\n",
+            "notes.txt\0",
+            (
+                "diff --git a/notes.txt b/notes.txt\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/notes.txt\n"
+            ),
         ]
     )
 
     def fake_run(command, **kwargs):
-        return subprocess.CompletedProcess(command, 0, stdout=next(outputs), stderr="")
+        commands.append(command)
+        returncode = 1 if "--no-index" in command else 0
+        return subprocess.CompletedProcess(command, returncode, stdout=next(outputs), stderr="")
 
     monkeypatch.setattr("minimal_dino.train.subprocess.run", fake_run)
     args = SimpleNamespace(output_dir=str(tmp_path), seed=42, model_revision="abc")
@@ -302,7 +292,23 @@ def test_save_run_artifacts_records_config_and_dirty_git_state(tmp_path, monkeyp
         "status": " M src/minimal_dino/train.py\n?? notes.txt",
         "diff_file": "git.diff",
     }
-    assert (tmp_path / "git.diff").read_text() == "diff --git a/file b/file\n"
+    assert (tmp_path / "git.diff").read_text() == (
+        "diff --git a/file b/file\n"
+        "diff --git a/notes.txt b/notes.txt\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/notes.txt\n"
+    )
+    assert ["git", "ls-files", "--others", "--exclude-standard", "-z"] in commands
+    assert [
+        "git",
+        "diff",
+        "--binary",
+        "--no-index",
+        "--",
+        "/dev/null",
+        "notes.txt",
+    ] in commands
 
 
 def test_save_run_artifacts_survives_missing_git(tmp_path, monkeypatch):
@@ -326,9 +332,9 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
         default_config = compose(
             config_name="config", overrides=["data.train_file=train.txt"]
         )
-        reset_config = compose(
+        scaled_center_config = compose(
             config_name="config",
-            overrides=["data.train_file=train.txt", "objective.reset_interval=25"],
+            overrides=["data.train_file=train.txt", "objective.center_scale=0.25"],
         )
         alternate_config = compose(
             config_name="config",
@@ -339,7 +345,7 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
                 "augmentation=word",
                 "model.random_init=true",
                 "model.pooling=cls",
-                "model.use_mlp=true",
+                "model.projection_dim=64",
                 "logging.quiet=true",
                 "logging.tensorboard=false",
                 "runtime.device=cpu",
@@ -347,24 +353,38 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
         )
 
     default_args = to_train_args(default_config)
-    reset_args = to_train_args(reset_config)
+    scaled_center_args = to_train_args(scaled_center_config)
     alternate_args = to_train_args(alternate_config)
 
-    assert default_args.objective == "dino"
-    assert default_args.dino_reset_interval is None
-    assert reset_args.dino_reset_interval == 25
+    assert default_args.objective == "byol"
     assert default_args.augmentation == "dropout"
     assert default_args.quiet is True
     assert default_args.tensorboard is True
-    assert default_args.dino_precision == "bf16"
+    assert default_args.byol_precision == "bf16"
     assert default_args.random_init is False
     assert default_args.pooling == "mean"
-    assert default_args.use_mlp is True
+    assert default_args.projection_dim == 256
+    assert default_args.projector_hidden_dim == 4096
+    assert default_args.predictor_hidden_dim == 4096
+    assert default_args.target_dropout == 0.02
+    assert default_args.center_momentum == 0.99
+    assert default_args.center_scale == 0.5
+    assert scaled_center_args.center_scale == 0.25
+    assert default_args.teacher_momentum == 0.999
+    assert default_args.batch_size == 32
+    assert default_args.encoder_learning_rate == 1e-5
+    assert default_args.head_learning_rate == 1e-4
+    assert default_args.encoder_freeze_steps == 200
+    assert default_args.max_length == 256
+    assert default_args.num_workers == 0
+    assert default_args.max_steps == 10000
+    assert default_args.eval_steps == 100
     assert alternate_args.objective == "infonce"
     assert alternate_args.infonce_temp == 0.2
     assert alternate_args.augmentation == "word"
     assert alternate_args.random_init is True
     assert alternate_args.pooling == "cls"
-    assert alternate_args.use_mlp is True
+    assert alternate_args.projection_dim == 64
+    assert alternate_args.center_scale == 0.5
     assert alternate_args.quiet is True
     assert alternate_args.tensorboard is False

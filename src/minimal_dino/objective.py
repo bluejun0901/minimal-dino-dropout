@@ -5,86 +5,59 @@ from torch import nn
 from torch.nn import functional as F
 
 
-class DINOLoss(nn.Module):
-    """Two-view DINO cross-entropy with teacher centering and sharpening."""
+class BYOLLoss(nn.Module):
+    """Symmetric BYOL regression with an EMA center for target embeddings."""
 
-    representation = "logits"
+    representation = "prediction"
     uses_teacher = True
 
-    def __init__(self, output_dim: int, student_temp: float = 0.1, center_momentum: float = 0.9):
+    def __init__(self, embedding_dim: int, center_momentum: float = 0.9) -> None:
         super().__init__()
-        if student_temp <= 0:
-            raise ValueError("student_temp must be positive")
-        if not 0 <= center_momentum < 1:
+        if isinstance(embedding_dim, bool) or not isinstance(embedding_dim, int):
+            raise ValueError("embedding_dim must be an integer")
+        if embedding_dim < 1:
+            raise ValueError("embedding_dim must be positive")
+        if not 0.0 <= center_momentum < 1.0:
             raise ValueError("center_momentum must be in [0, 1)")
-        self.student_temp = student_temp
         self.center_momentum = center_momentum
-        self.register_buffer("center", torch.zeros(1, output_dim))
+        self.register_buffer("center", torch.zeros(1, embedding_dim))
 
     def forward(
         self,
-        student_views: tuple[torch.Tensor, torch.Tensor],
-        teacher_views: tuple[torch.Tensor, torch.Tensor],
-        teacher_temp: float,
+        student_predictions: tuple[torch.Tensor, torch.Tensor],
+        teacher_projections: tuple[torch.Tensor, torch.Tensor],
         *,
         compute_metrics: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if teacher_temp <= 0:
-            raise ValueError("teacher_temp must be positive")
-
-        # Keep the large-temperature-scaled softmaxes in FP32 even when the encoders and
-        # projection heads run under BF16 autocast.
-        student_log_probs = tuple(
-            F.log_softmax(view.float() / self.student_temp, dim=-1) for view in student_views
-        )
-        if teacher_views[0] is teacher_views[1]:
-            # Dropout augmentation gives the deterministic EMA teacher the same input
-            # twice. Reuse its distribution instead of launching a duplicate softmax.
-            teacher_prob = F.softmax(
-                (teacher_views[0].float() - self.center) / teacher_temp, dim=-1
-            ).detach()
-            teacher_probs = (teacher_prob, teacher_prob)
-        else:
-            teacher_probs = tuple(
-                F.softmax((view.float() - self.center) / teacher_temp, dim=-1).detach()
-                for view in teacher_views
-            )
-
-        # Match only opposite dropout views, as in DINO's two-global-view pseudocode.
-        loss_12 = -(teacher_probs[0] * student_log_probs[1]).sum(dim=-1).mean()
-        loss_21 = -(teacher_probs[1] * student_log_probs[0]).sum(dim=-1).mean()
-        loss = (loss_12 + loss_21) / 2
+        student1, student2 = student_predictions
+        teacher1, teacher2 = (view.float().detach() for view in teacher_projections)
+        cosine_12 = F.cosine_similarity(student1.float(), teacher2.float(), dim=-1)
+        cosine_21 = F.cosine_similarity(student2.float(), teacher1.float(), dim=-1)
+        loss = (2.0 - 2.0 * cosine_12.mean() + 2.0 - 2.0 * cosine_21.mean()) / 2.0
 
         if not compute_metrics:
             return loss, {}
-
-        teacher_prob = torch.cat(teacher_probs)
-        student_prob = torch.cat(tuple(log_prob.detach().exp() for log_prob in student_log_probs))
-        eps = torch.finfo(teacher_prob.dtype).eps
-        metrics = {
-            "teacher_entropy": -(teacher_prob * teacher_prob.clamp_min(eps).log())
-            .sum(dim=-1)
+        return loss, {
+            "byol_cosine": torch.cat((cosine_12.detach(), cosine_21.detach())).mean(),
+            "student_prediction_std": torch.cat((student1, student2))
+            .detach()
+            .float()
+            .std(dim=0, unbiased=False)
             .mean(),
-            "teacher_batch_entropy": -(
-                teacher_prob.mean(dim=0) * teacher_prob.mean(dim=0).clamp_min(eps).log()
-            ).sum(),
-            "student_entropy": -(student_prob * student_prob.clamp_min(eps).log())
-            .sum(dim=-1)
+            "teacher_projection_std": torch.cat((teacher1, teacher2))
+            .float()
+            .std(dim=0, unbiased=False)
             .mean(),
             "center_norm": self.center.norm(),
         }
-        return loss, metrics
 
     @torch.no_grad()
-    def update_center(self, teacher_views: tuple[torch.Tensor, torch.Tensor]) -> None:
-        # Update after computing the loss, so the current batch uses the previous center.
-        if teacher_views[0] is teacher_views[1]:
-            batch_center = teacher_views[0].float().mean(dim=0, keepdim=True)
-        else:
-            batch_center = torch.cat(teacher_views).float().mean(dim=0, keepdim=True)
-        self.center.mul_(self.center_momentum).add_(batch_center, alpha=1 - self.center_momentum)
-
-
+    def update_center(self, teacher_embeddings: tuple[torch.Tensor, torch.Tensor]) -> None:
+        """Update the center from raw target embeddings after the current loss."""
+        batch_center = torch.cat(teacher_embeddings).float().mean(dim=0, keepdim=True)
+        self.center.mul_(self.center_momentum).add_(
+            batch_center, alpha=1.0 - self.center_momentum
+        )
 
 
 class InfoNCELoss(nn.Module):
@@ -130,14 +103,17 @@ class InfoNCELoss(nn.Module):
 def build_objective(
     name: str,
     *,
-    output_dim: int,
-    student_temp: float,
+    projection_dim: int,
+    embedding_dim: int | None = None,
     center_momentum: float,
     infonce_temp: float,
-) -> DINOLoss | InfoNCELoss:
+) -> BYOLLoss | InfoNCELoss:
     """Construct an objective while keeping objective-specific settings local."""
-    if name == "dino":
-        return DINOLoss(output_dim, student_temp, center_momentum)
+    if name == "byol":
+        return BYOLLoss(
+            projection_dim if embedding_dim is None else embedding_dim,
+            center_momentum,
+        )
     if name == "infonce":
         return InfoNCELoss(infonce_temp)
     raise ValueError(f"Unknown objective: {name}")

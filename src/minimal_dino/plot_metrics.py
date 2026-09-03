@@ -80,7 +80,7 @@ def plot_metrics(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot metrics from a minimal DINO JSONL log")
+    parser = argparse.ArgumentParser(description="Plot metrics from a minimal BYOL JSONL log")
     parser.add_argument("input", help="Path to metrics.jsonl")
     parser.add_argument("--output", help="Output image path; defaults to metrics.png beside input")
     parser.add_argument(

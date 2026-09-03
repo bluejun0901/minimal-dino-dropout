@@ -1,4 +1,2 @@
-temperature: 0.06
-warmup_temperature: 0.04
-temperature_warmup_steps: 0
+dropout: 0.02
 momentum: 0.999

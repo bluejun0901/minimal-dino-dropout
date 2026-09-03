@@ -32,7 +32,12 @@ def test_load_stsb_split_reports_missing_download(tmp_path):
 def test_load_checkpoint_uses_student_weights(tmp_path, monkeypatch):
     checkpoint = {
         "encoder_config": {"model_type": "fake", "hidden_size": 2},
-        "head_config": {"output_dim": 3},
+        "head_config": {
+            "projection_dim": 3,
+            "projector_hidden_dim": 4,
+            "predictor_hidden_dim": 4,
+            "pooling": "mean",
+        },
         "student": {"weight": torch.tensor([1.0])},
         "teacher": {"weight": torch.tensor([2.0])},
     }
@@ -57,7 +62,7 @@ def test_load_checkpoint_uses_student_weights(tmp_path, monkeypatch):
         evaluation.AutoConfig, "for_model", lambda model_type, **config: config
     )
     monkeypatch.setattr(evaluation.AutoModel, "from_config", lambda config: config)
-    monkeypatch.setattr(evaluation, "SentenceDINO", FakeModel)
+    monkeypatch.setattr(evaluation, "SentenceBYOL", FakeModel)
     monkeypatch.setattr(
         evaluation.AutoTokenizer, "from_pretrained", lambda path: "tokenizer"
     )

@@ -1,22 +1,21 @@
 import torch
 from torch.nn import functional as F
 
-from minimal_dino.objective import DINOLoss, InfoNCELoss, build_objective
+from minimal_dino.objective import BYOLLoss, InfoNCELoss, build_objective
 
 
-def test_dino_loss_uses_only_opposite_views_and_stops_teacher_gradient():
-    objective = DINOLoss(output_dim=3, student_temp=0.2, center_momentum=0.5)
+def test_byol_loss_matches_opposite_views_and_stops_teacher_gradient():
+    objective = BYOLLoss(embedding_dim=3)
     student1 = torch.tensor([[0.2, -0.1, 0.4]], requires_grad=True)
     student2 = torch.tensor([[0.5, 0.0, -0.2]], requires_grad=True)
     teacher1 = torch.tensor([[0.1, 0.3, -0.2]], requires_grad=True)
     teacher2 = torch.tensor([[0.4, -0.1, 0.2]], requires_grad=True)
 
-    loss, _ = objective((student1, student2), (teacher1, teacher2), teacher_temp=0.1)
-    probability1 = F.softmax(teacher1.detach() / 0.1, dim=-1)
-    probability2 = F.softmax(teacher2.detach() / 0.1, dim=-1)
+    loss, metrics = objective((student1, student2), (teacher1, teacher2))
     expected = (
-        -(probability1 * F.log_softmax(student2 / 0.2, dim=-1)).sum()
-        - (probability2 * F.log_softmax(student1 / 0.2, dim=-1)).sum()
+        2 - 2 * F.cosine_similarity(student1, teacher2).mean()
+        + 2
+        - 2 * F.cosine_similarity(student2, teacher1).mean()
     ) / 2
     loss.backward()
 
@@ -25,46 +24,56 @@ def test_dino_loss_uses_only_opposite_views_and_stops_teacher_gradient():
     assert student2.grad is not None
     assert teacher1.grad is None
     assert teacher2.grad is None
+    assert torch.allclose(metrics["byol_cosine"], 1 - loss.detach() / 2)
 
 
-def test_center_uses_raw_teacher_logits_after_loss():
-    objective = DINOLoss(output_dim=2, center_momentum=0.5)
-    views = (torch.tensor([[2.0, 0.0]]), torch.tensor([[0.0, 2.0]]))
-    student = (torch.zeros(1, 2), torch.zeros(1, 2))
-
-    _, metrics_before = objective(student, views, teacher_temp=0.1)
-    objective.update_center(views)
-
-    assert metrics_before["center_norm"].item() == 0.0
-    assert torch.equal(objective.center, torch.tensor([[0.5, 0.5]]))
-
-
-def test_dino_can_skip_diagnostics_without_changing_loss():
-    objective = DINOLoss(output_dim=3, student_temp=0.2)
+def test_byol_loss_is_scale_invariant():
+    objective = BYOLLoss(embedding_dim=3)
     student = (torch.randn(2, 3), torch.randn(2, 3))
     teacher = (torch.randn(2, 3), torch.randn(2, 3))
 
-    expected, metrics = objective(student, teacher, teacher_temp=0.1)
-    actual, skipped_metrics = objective(
-        student, teacher, teacher_temp=0.1, compute_metrics=False
+    expected, _ = objective(student, teacher)
+    actual, _ = objective(
+        (student[0] * 3, student[1] * 5), (teacher[0] * 7, teacher[1] * 11)
     )
+
+    assert torch.allclose(actual, expected)
+
+
+def test_byol_can_skip_diagnostics_without_changing_loss():
+    objective = BYOLLoss(embedding_dim=3)
+    student = (torch.randn(2, 3), torch.randn(2, 3))
+    teacher = (torch.randn(2, 3), torch.randn(2, 3))
+
+    expected, metrics = objective(student, teacher)
+    actual, skipped_metrics = objective(student, teacher, compute_metrics=False)
 
     assert torch.equal(actual, expected)
     assert metrics
     assert skipped_metrics == {}
 
 
-def test_dino_reuses_shared_teacher_view_for_loss_and_center():
-    objective = DINOLoss(output_dim=3, student_temp=0.2, center_momentum=0.5)
-    student = (torch.randn(2, 3), torch.randn(2, 3))
-    teacher = torch.randn(2, 3)
+def test_byol_center_updates_from_raw_teacher_embeddings_after_loss():
+    objective = BYOLLoss(embedding_dim=2, center_momentum=0.5)
+    teacher = (torch.tensor([[2.0, 0.0]]), torch.tensor([[0.0, 2.0]]))
+    student = (torch.ones(1, 2), torch.ones(1, 2))
 
-    shared_loss, _ = objective(student, (teacher, teacher), teacher_temp=0.1)
-    copied_loss, _ = objective(student, (teacher, teacher.clone()), teacher_temp=0.1)
-    objective.update_center((teacher, teacher))
+    _, metrics_before = objective(student, teacher)
+    objective.update_center(teacher)
 
-    assert torch.equal(shared_loss, copied_loss)
-    assert torch.allclose(objective.center, teacher.mean(dim=0, keepdim=True) * 0.5)
+    assert metrics_before["center_norm"] == 0
+    assert torch.equal(objective.center, torch.tensor([[0.5, 0.5]]))
+
+
+def test_byol_loss_does_not_center_target_after_projection():
+    objective = BYOLLoss(embedding_dim=2)
+    objective.center.copy_(torch.tensor([[1.0, 1.0]]))
+    student = (torch.tensor([[1.0, 0.0]]), torch.tensor([[0.0, 1.0]]))
+    teacher = (torch.tensor([[0.0, 1.0]]), torch.tensor([[1.0, 0.0]]))
+
+    loss, _ = objective(student, teacher)
+
+    assert torch.equal(loss, torch.tensor(0.0))
 
 
 def test_infonce_uses_diagonal_pairs_in_both_directions():
@@ -86,15 +95,21 @@ def test_infonce_uses_diagonal_pairs_in_both_directions():
 
 
 def test_objective_factory_defaults_to_distinct_representation_paths():
-    dino = build_objective(
-        "dino", output_dim=3, student_temp=0.1, center_momentum=0.9, infonce_temp=0.05
+    byol = build_objective(
+        "byol",
+        projection_dim=3,
+        embedding_dim=5,
+        center_momentum=0.8,
+        infonce_temp=0.05,
     )
     infonce = build_objective(
-        "infonce", output_dim=3, student_temp=0.1, center_momentum=0.9, infonce_temp=0.2
+        "infonce", projection_dim=3, center_momentum=0.8, infonce_temp=0.2
     )
 
-    assert isinstance(dino, DINOLoss)
-    assert dino.representation == "logits"
+    assert isinstance(byol, BYOLLoss)
+    assert byol.representation == "prediction"
+    assert byol.center_momentum == 0.8
+    assert byol.center.shape == (1, 5)
     assert isinstance(infonce, InfoNCELoss)
     assert infonce.representation == "embedding"
     assert infonce.temperature == 0.2

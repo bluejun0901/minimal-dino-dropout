@@ -1,5 +1,5 @@
-output_dir: runs/minimal-dino
+output_dir: runs/minimal-byol
 seed: 42
 device: auto
-# Used only by the DINO training path. Ampere GPUs such as the A6000 support BF16.
-dino_precision: bf16
+# Used only by the BYOL training path. Ampere GPUs such as the A6000 support BF16.
+byol_precision: bf16

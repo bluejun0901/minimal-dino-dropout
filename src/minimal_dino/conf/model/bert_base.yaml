@@ -1,10 +1,8 @@
 name: bert-base-uncased
 revision: 86b5e0934494bd15c9632b12f734a8a67f723594
 random_init: false
-dropout: 0.05
+dropout: 0.2
 pooling: mean
-use_mlp: false
-output_dim: 65536
-head_hidden_dim: 2048
-bottleneck_dim: 256
-uniformity_step_size: 1.0
+projection_dim: 256
+projector_hidden_dim: 4096
+predictor_hidden_dim: 4096

@@ -1,150 +1,82 @@
 from __future__ import annotations
 
-import argparse
 import gc
-import json
+import math
 from pathlib import Path
 from typing import Any
 
+import hydra
 import optuna
 import torch
-from hydra import compose, initialize_config_module
+from omegaconf import DictConfig, OmegaConf
 
 from minimal_dino.config import to_train_args
 from minimal_dino.train import train
 
-MANAGED_OVERRIDE_KEYS = {
-    "optimization.learning_rate",
-    "optimization.batch_size",
-    "optimization.weight_decay",
-    "optimization.warmup_ratio",
-    "model.dropout",
-    "model.use_mlp",
-    "model.uniformity_step_size",
-    "objective.student_temp",
-    "objective.reset_interval",
-    "teacher.temperature",
-    "objective.center_momentum",
-    "teacher.momentum",
-    "runtime.output_dir",
-    "logging.tensorboard",
-    "checkpoint.save_steps",
-}
-OPTUNA_TO_HYDRA = {
-    "learning_rate": "optimization.learning_rate",
-    "batch_size": "optimization.batch_size",
-    "weight_decay": "optimization.weight_decay",
-    "warmup_ratio": "optimization.warmup_ratio",
-    "dropout": "model.dropout",
-    "use_mlp": "model.use_mlp",
-    "uniformity_step_size": "model.uniformity_step_size",
-    "student_temp": "objective.student_temp",
-    "reset_interval": "objective.reset_interval",
-    "teacher_temperature": "teacher.temperature",
-    "center_momentum": "objective.center_momentum",
-    "teacher_momentum": "teacher.momentum",
-}
+
+def sample_config(config: DictConfig, trial: optuna.Trial) -> DictConfig:
+    """Return a per-trial training config with the five requested parameters sampled."""
+    trial_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
+    search = config.tuning.search
+
+    dropout_low, dropout_high = search.model_dropout
+    # ``to_train_args`` requires target dropout to be strictly lower than model dropout.
+    dropout_low = max(float(dropout_low), float(config.teacher.dropout) + 1e-6)
+    if dropout_low > dropout_high:
+        raise ValueError("model_dropout search range must include values above teacher.dropout")
+
+    trial_config.objective.center_scale = trial.suggest_float(
+        "center_scale", *search.center_scale
+    )
+    trial_config.model.dropout = trial.suggest_float(
+        "model_dropout", dropout_low, float(dropout_high)
+    )
+    trial_config.objective.center_momentum = trial.suggest_float(
+        "center_momentum", *search.center_momentum
+    )
+    trial_config.optimization.encoder_learning_rate = trial.suggest_float(
+        "encoder_learning_rate", *search.encoder_learning_rate, log=True
+    )
+    trial_config.optimization.head_learning_rate = trial.suggest_float(
+        "head_learning_rate", *search.head_learning_rate, log=True
+    )
+    return trial_config
 
 
-def suggest_hyperparameters(trial: optuna.Trial) -> dict[str, Any]:
-    """Return the focused DINO + dropout search space."""
-    return {
-        "optimization.learning_rate": trial.suggest_float(
-            "learning_rate", 1.0e-5, 5.0e-5, log=True
-        ),
-        "optimization.batch_size": trial.suggest_categorical("batch_size", [32, 64]),
-        "optimization.weight_decay": trial.suggest_categorical(
-            "weight_decay", [0.0, 0.01, 0.05, 0.1]
-        ),
-        "optimization.warmup_ratio": trial.suggest_categorical(
-            "warmup_ratio", [0.0, 0.05, 0.1, 0.2]
-        ),
-        "model.dropout": trial.suggest_float("dropout", 0.05, 0.3, step=0.05),
-        "model.use_mlp": trial.suggest_categorical("use_mlp", [True, False]),
-        "model.uniformity_step_size": trial.suggest_categorical(
-            "uniformity_step_size", [0.0, 0.001, 0.01, 0.05, 0.1, 0.5]
-        ),
-        "objective.student_temp": trial.suggest_float(
-            "student_temp", 0.05, 0.2, step=0.05
-        ),
-        "objective.reset_interval": trial.suggest_categorical(
-            "reset_interval", [None, 150, 300, 600]
-        ),
-        "teacher.temperature": trial.suggest_float(
-            "teacher_temperature", 0.01, 0.1
-        ),
-        "objective.center_momentum": trial.suggest_categorical(
-            "center_momentum", [0.5, 0.9, 0.99, 0.999]
-        ),
-        "teacher.momentum": trial.suggest_categorical(
-            "teacher_momentum", [0.99, 0.996, 0.999, 0.9999]
-        ),
-    }
+def run_trial(config: DictConfig, trial: optuna.Trial) -> float:
+    """Train one configuration and return its best validation metric."""
+    trial_config = sample_config(config, trial)
+    base_output_dir = Path(config.runtime.output_dir)
+    trial_output_dir = base_output_dir / f"trial-{trial.number:04d}"
+    trial_config.runtime.output_dir = str(trial_output_dir)
+    trial_config.checkpoint.resume_from = None
+    trial_config.checkpoint.save_steps = 0
+    trial_config.logging.tensorboard = False
+    trial_config.logging.quiet = True
 
-
-def validate_base_overrides(overrides: list[str]) -> None:
-    """Prevent callers from changing the experiment family or trial-owned values."""
-    for override in overrides:
-        key = override.lstrip("+").split("=", 1)[0]
-        if key in {"objective", "objective.name", "augmentation", "augmentation.name"}:
-            raise ValueError("objective and augmentation are fixed to DINO + dropout")
-        if key in MANAGED_OVERRIDE_KEYS:
-            raise ValueError(f"Override is managed by the tuner: {key}")
-
-
-def parameter_overrides(parameters: dict[str, Any]) -> list[str]:
-    def hydra_value(value: Any) -> str:
-        if value is None:
-            return "null"
-        if isinstance(value, bool):
-            return str(value).lower()
-        return str(value)
-
-    return [f"{key}={hydra_value(value)}" for key, value in parameters.items()]
-
-
-def run_trial(
-    trial: optuna.Trial,
-    *,
-    output_root: Path,
-    base_overrides: list[str],
-) -> float:
-    parameters = suggest_hyperparameters(trial)
-    trial_dir = output_root / f"trial-{trial.number:04d}"
-    if trial_dir.exists():
-        raise FileExistsError(f"Trial output already exists: {trial_dir}")
-
-    overrides = [
-        "objective=dino",
-        "augmentation=dropout",
-        *base_overrides,
-        *parameter_overrides(parameters),
-        f"runtime.output_dir={trial_dir}",
-        "logging.tensorboard=false",
-        "checkpoint.save_steps=0",
-    ]
-    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
-        config = compose(config_name="config", overrides=overrides)
-    args = to_train_args(config)
-
-    observed_scores: list[tuple[int, float]] = []
+    metric_name = str(config.tuning.metric)
+    best_value = -math.inf
+    evaluation_count = 0
 
     def report_evaluation(step: int, metrics: dict[str, float]) -> None:
-        score = float(metrics["max_sts_spearman"])
-        observed_scores.append((step, score))
+        nonlocal best_value, evaluation_count
+        # Step zero is independent of sampled hyperparameters and is not useful for pruning.
         if step == 0:
             return
-        trial.report(score, step=step)
+        if metric_name not in metrics:
+            raise KeyError(f"Evaluation did not produce tuning metric {metric_name!r}")
+        value = float(metrics[metric_name])
+        best_value = max(best_value, value)
+        evaluation_count += 1
+        trial.report(value, step)
         if trial.should_prune():
-            raise optuna.TrialPruned(
-                f"Pruned at step {step} with max STS-B Spearman {score:.6f}"
-            )
+            raise optuna.TrialPruned(f"pruned at training step {step}")
 
-    trial.set_user_attr("output_dir", str(trial_dir))
+    trial.set_user_attr("output_dir", str(trial_output_dir))
     try:
         train(
-            args,
-            run_config=config,
+            to_train_args(trial_config),
+            run_config=trial_config,
             evaluation_callback=report_evaluation,
             save_final_checkpoint=False,
         )
@@ -153,86 +85,45 @@ def run_trial(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    positive_step_scores = [score for step, score in observed_scores if step > 0]
-    if not positive_step_scores:
-        raise RuntimeError(
-            "No post-training evaluation was produced. Set evaluation.steps no larger than "
-            "optimization.max_steps (or the number of steps in one epoch)."
+    if evaluation_count == 0:
+        raise ValueError(
+            "No post-training evaluation ran; set evaluation.steps <= optimization.max_steps"
         )
-    return positive_step_scores[-1]
+    return best_value
 
 
-def default_storage(output_root: Path, study_name: str) -> str:
-    database = (output_root / f"{study_name}.db").resolve()
-    return f"sqlite:///{database}"
-
-
-def save_best_trial(study: optuna.Study, output_root: Path) -> Path:
-    hydra_parameters = {
-        OPTUNA_TO_HYDRA[name]: value for name, value in study.best_params.items()
-    }
-    result = {
-        "study_name": study.study_name,
-        "trial_number": study.best_trial.number,
-        "value": study.best_value,
-        "parameters": study.best_params,
-        "hydra_overrides": parameter_overrides(hydra_parameters),
-        "output_dir": study.best_trial.user_attrs.get("output_dir"),
-    }
-    path = output_root / "best_trial.json"
-    temporary_path = path.with_suffix(".json.tmp")
-    temporary_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    temporary_path.replace(path)
-    return path
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tune the DINO + dropout configuration")
-    parser.add_argument("overrides", nargs="*", help="Fixed Hydra overrides for every trial")
-    parser.add_argument("--n-trials", type=int, default=30)
-    parser.add_argument("--timeout", type=int, help="Overall timeout in seconds")
-    parser.add_argument("--study-name", default="dino-dropout")
-    parser.add_argument("--output-root", type=Path, default=Path("runs/optuna/dino-dropout"))
-    parser.add_argument("--storage", help="Optuna storage URL; defaults to SQLite in output-root")
-    parser.add_argument("--sampler-seed", type=int, default=42)
-    parser.add_argument("--pruner-startup-trials", type=int, default=5)
-    parser.add_argument("--pruner-warmup-steps", type=int, default=250)
-    return parser.parse_args()
-
-
-def main() -> None:
-    cli = parse_args()
-    if cli.n_trials < 1:
-        raise ValueError("--n-trials must be positive")
-    validate_base_overrides(cli.overrides)
-    cli.output_root.mkdir(parents=True, exist_ok=True)
-
-    study = optuna.create_study(
-        study_name=cli.study_name,
-        storage=cli.storage or default_storage(cli.output_root, cli.study_name),
+def create_study(config: DictConfig) -> optuna.Study:
+    tuning: dict[str, Any] = OmegaConf.to_container(
+        config.tuning, resolve=True, throw_on_missing=True
+    )
+    sampler = optuna.samplers.TPESampler(seed=int(tuning["sampler_seed"]))
+    pruner = optuna.pruners.MedianPruner(
+        n_startup_trials=int(tuning["pruner_startup_trials"]),
+        n_warmup_steps=int(tuning["pruner_warmup_steps"]),
+    )
+    return optuna.create_study(
+        study_name=str(tuning["study_name"]),
         direction="maximize",
+        sampler=sampler,
+        pruner=pruner,
+        storage=tuning["storage"],
         load_if_exists=True,
-        sampler=optuna.samplers.TPESampler(seed=cli.sampler_seed),
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=cli.pruner_startup_trials,
-            n_warmup_steps=cli.pruner_warmup_steps,
-        ),
     )
+
+
+@hydra.main(version_base="1.3", config_path="conf", config_name="tune")
+def main(config: DictConfig) -> None:
+    output_dir = Path(config.runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    study = create_study(config)
     study.optimize(
-        lambda trial: run_trial(
-            trial,
-            output_root=cli.output_root,
-            base_overrides=cli.overrides,
-        ),
-        n_trials=cli.n_trials,
-        timeout=cli.timeout,
-        gc_after_trial=True,
-        catch=(torch.cuda.OutOfMemoryError,),
+        lambda trial: run_trial(config, trial),
+        n_trials=int(config.tuning.n_trials),
+        timeout=config.tuning.timeout,
     )
-    result_path = save_best_trial(study, cli.output_root)
-    print(f"Best STS-B Spearman: {study.best_value:.6f}")
-    print(f"Best parameters: {json.dumps(study.best_params, sort_keys=True)}")
-    print(f"Saved summary to {result_path}")
+    print(f"best value: {study.best_value:.6f}")
+    print(f"best params: {study.best_params}")
+    print(f"best trial output: {study.best_trial.user_attrs['output_dir']}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 epochs: 1
 batch_size: 32
-learning_rate: 3.0e-5
+encoder_learning_rate: 0.1e-5
+head_learning_rate: 1.0e-4
+encoder_freeze_steps: 200
 weight_decay: 0.01
 warmup_ratio: 0.1
 max_grad_norm: 1.0
-max_steps: 3000
+max_steps: 5000

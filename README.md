@@ -1,289 +1,128 @@
-# Minimal DINO / InfoNCE sentence embeddings
+# Minimal BYOL / InfoNCE sentence embeddings
 
-This repository is a deliberately narrow baseline with independently selectable objectives and
-view augmentation:
+This repository trains sentence embeddings with independently selectable objectives and view
+augmentation:
 
 ```text
 bert-base-uncased -> configurable [CLS] or attention-mask-aware mean pooling
     -> two independent dropout or word-augmented views
-    -> DINO: student / EMA teacher -> centered, sharpened cross-entropy
-    -> InfoNCE: student view 1 / student view 2 -> symmetric in-batch contrastive loss
+    -> BYOL: online projector + predictor / EMA target projector -> cosine regression
+    -> InfoNCE: online view 1 / online view 2 -> symmetric in-batch contrastive loss
 ```
 
-There is no token masking, predictor, auxiliary loss, or multi-crop analogue. Sentence embeddings
-come from the configured last-layer pooling before the DINO head. Mean pooling excludes padding
-tokens. Evaluation disables augmentation and uses the online student.
+The BYOL path has no class logits, softmax temperatures, negatives, or periodic head
+resets. The target branch is stop-gradient and its network is updated by an EMA of the online
+network. Sentence embeddings used for evaluation are pooled encoder representations before the
+BYOL head.
 
-## 1. Create the environment
+## Setup
 
 ```bash
 uv sync --extra dev
 source .venv/bin/activate
 ```
 
-Keep the environment activated before every `uv run python ...` command below.
+Training data is a UTF-8 file with one sentence per line. STS-B evaluation expects local
+`validation.parquet` and `test.parquet` files under `data/stsb`.
 
-## 2. Download the SimCSE training data
-
-Training data is UTF-8 text with one sentence per line. The reference experiment uses SimCSE's
-one-million-sentence English Wikipedia sample:
-
-```bash
-mkdir -p data
-wget -c \
-  https://huggingface.co/datasets/princeton-nlp/datasets-for-simcse/resolve/main/wiki1m_for_simcse.txt \
-  -O data/wiki1m_for_simcse.txt
-wc -l data/wiki1m_for_simcse.txt
-```
-
-The final command should report `1000000` lines.
-
-Download the STS-B evaluation splits separately as well. These URLs pin dataset commit
-`feb8fb722daa8c2fc249baf94e9c8e93b3345b7f`, and the checksum step verifies the files before
-training starts:
-
-```bash
-mkdir -p data/stsb
-wget -c \
-  https://huggingface.co/datasets/sentence-transformers/stsb/resolve/feb8fb722daa8c2fc249baf94e9c8e93b3345b7f/data/validation-00000-of-00001.parquet \
-  -O data/stsb/validation.parquet
-wget -c \
-  https://huggingface.co/datasets/sentence-transformers/stsb/resolve/feb8fb722daa8c2fc249baf94e9c8e93b3345b7f/data/test-00000-of-00001.parquet \
-  -O data/stsb/test.parquet
-sha256sum -c <<'EOF'
-9c6e0e9881f1b398abe3e439a482f4686305c3784568c462f6bba58bdff03b0a  data/stsb/validation.parquet
-8acbc291c50977d8655934952956016c3e049c2fe04f8a6c454c1bf6acc42ca1  data/stsb/test.parquet
-EOF
-```
-
-## 3. Run the full training pipeline
+## Train
 
 ```bash
 source .venv/bin/activate
-export CUDA_VISIBLE_DEVICES=0
-
 uv run python -m minimal_dino.train \
   data.train_file=data/wiki1m_for_simcse.txt \
-  runtime.output_dir=runs/dino-mean-bert-base-seed42 \
+  runtime.output_dir=runs/byol-mean-bert-base-seed42 \
   optimization.epochs=1 \
   optimization.batch_size=64 \
-  data.max_length=512 \
-  optimization.learning_rate=3e-5 \
-  runtime.seed=42 \
-  logging.steps=10 \
-  evaluation.steps=250 \
-  checkpoint.save_steps=500 \
-  checkpoint.keep_last=2 \
+  optimization.encoder_learning_rate=1e-5 \
+  optimization.head_learning_rate=1e-4 \
   runtime.device=cuda
 ```
 
-Training configuration is composed by Hydra from files under `src/minimal_dino/conf`. The
-top-level defaults are split into `data`, `model`, `augmentation`, `objective`, `optimization`,
-`teacher`, `evaluation`, `checkpoint`, `runtime`, and `logging`. Override a field with
-`section.field=value`, or select a config-group option such as `objective=infonce` or
-`augmentation=word`. Hydra saves the composed YAML to
-`<runtime.output_dir>/.hydra/config.yaml`; the run also keeps its JSON reproduction artifact.
+The default BYOL head uses a `768 -> 4096 -> 256` projector and a
+`256 -> 4096 -> 256` predictor. Both MLPs use LayerNorm and ReLU; LayerNorm keeps singleton final
+minibatches valid. Configure them with `model.projection_dim`, `model.projector_hidden_dim`, and
+`model.predictor_hidden_dim`. The target network consumes only projector outputs. Its momentum is
+cosine-scheduled from `teacher.momentum` to 1.
 
-The DINO path uses BF16 encoder and projection-head computation on BF16-capable CUDA devices by
-default, while keeping its temperature-scaled softmaxes in FP32. This is suitable for Ampere GPUs
-such as the RTX A6000. Set `runtime.dino_precision=fp32` to disable mixed precision. The InfoNCE
-path remains FP32 regardless of this setting.
+The encoder is frozen for the first `optimization.encoder_freeze_steps=200` optimizer steps while
+the randomly initialized projector and predictor adapt. Afterward it is unfrozen automatically.
+The encoder and head use separate learning rates (`1e-5` and `1e-4` by default), including their
+independent warmup and linear decay through the shared scheduler.
 
-The default uses mean pooling and applies the normalized output layer directly to the pooled BERT
-representation. Set `model.pooling=cls` to use the first token instead, and set
-`model.use_mlp=true` to enable the `2048 -> 2048 -> 256` projection MLP before the output layer.
-These choices are stored in checkpoints and must match when resuming. Student temperature is 0.1,
-center momentum is 0.9, and teacher EMA momentum is cosine-scheduled from 0.996 to 1. BERT hidden
-and attention dropout are both 0.1 and can be changed together with `model.dropout`. The token ids
-and masks are identical in every dropout view; only BERT dropout masks differ.
+The raw target embedding is centered before it enters the projector. The center is an EMA of
+previous target-embedding batch means and is updated only after computing each batch loss. Configure
+its decay with `objective.center_momentum` (default `0.99`) and the multiplier applied before subtraction with
+`objective.center_scale` (default `0.5`); the center is stored in checkpoints and its norm is logged
+as `center_norm`.
 
-For DINO, set `objective.reset_interval=N` to reset its state after every `N` completed optimizer
-steps. A reset copies the online student directly to the teacher and zeros the center. Its default
-value is `null`, which keeps the original EMA teacher and center behavior unchanged.
+The default dropout augmentation feeds identical tokens through independent masks. Online views
+use `model.dropout=0.1`; target views use independent, less noisy masks controlled by
+`teacher.dropout=0.02`. The target rate must be positive and lower than the online rate. Select
+`augmentation=word` for word-level views, or `objective=infonce` to retain the contrastive
+baseline. On CUDA, BYOL uses BF16 by default; set `runtime.byol_precision=fp32` to disable it.
 
-Set `model.random_init=true` to use the architecture and tokenizer selected by `model.name` without
-loading its pretrained encoder weights. The encoder is initialized randomly from the model
-configuration; the projection head is always initialized randomly regardless of this option.
+Hydra writes its resolved config under the run directory. Full checkpoints contain the online and
+target networks, objective, optimizer, scheduler, RNG state, architecture config, and tokenizer.
+Old DINO checkpoints and DINO configuration keys are intentionally unsupported.
 
-The default `augmentation=dropout` preserves that behavior. To compare it with word-level
-augmentation, use for example:
+## Resume and evaluate
 
 ```bash
 uv run python -m minimal_dino.train \
   data.train_file=data/wiki1m_for_simcse.txt \
-  runtime.output_dir=runs/dino-word-seed42 \
-  augmentation=word \
-  augmentation.strength=0.1 \
-  runtime.seed=42
-```
+  runtime.output_dir=runs/byol-mean-bert-base-seed42 \
+  checkpoint.resume_from=runs/byol-mean-bert-base-seed42/checkpoint-step-500.pt
 
-In word mode, each word is selected independently with probability `augmentation.strength`.
-Each selected word is then repeated once, deleted, or replaced by another word from its sentence,
-with the three operations chosen uniformly. Two views are generated before tokenization and BERT
-dropout is disabled. A strength of zero leaves the text unchanged.
-
-The default `objective=dino` preserves the original training behavior. To switch only the
-objective to InfoNCE, use:
-
-```bash
-uv run python -m minimal_dino.train \
-  data.train_file=data/wiki1m_for_simcse.txt \
-  runtime.output_dir=runs/infonce-dropout-seed42 \
-  objective=infonce \
-  objective.temperature=0.05 \
-  runtime.seed=42
-```
-
-InfoNCE uses the configured pooled embeddings directly. Each example's two augmented views form
-the positive pair, all other examples in the batch are negatives, and the two view directions are
-averaged. The EMA teacher is still maintained for training, while evaluation consistently uses the
-online student regardless of the selected objective.
-
-Every 500 steps, training atomically writes a full resumable checkpoint named
-`checkpoint-step-N.pt`. Only the newest two periodic checkpoints are retained, because each full
-BERT student/teacher checkpoint is large. At successful completion, `checkpoint.pt` is also
-written. Checkpoints include both networks, center, optimizer, scheduler, RNG states, configuration,
-and tokenizer.
-
-Training logs JSON diagnostics for loss, gradient norm, dropout-view cosine, center norm,
-teacher/student entropy, embedding standard deviation, and cross-sentence cosine.
-Every JSON record printed to stdout is also appended immediately to `metrics.jsonl` in the run
-directory. The same values are written to `<runtime.output_dir>/tensorboard` under `train/*` and
-`eval/*` tags. View them while training with:
-
-```bash
-uv run tensorboard --logdir runs
-```
-
-Set `logging.tensorboard=false` to disable TensorBoard logging. STS-B validation runs at step 0 and
-then at every `evaluation.steps` interval. Each
-evaluation also reports embedding uniformity and alignment: the mean squared Euclidean distance
-between L2-normalized embeddings for STS pairs whose normalized score is higher than 0.8. STS
-sentences are evaluated without truncation. Resumed runs append to the existing file without
-duplicating the step-0 record.
-Set `logging.quiet=true` to show only a compact training progress bar while keeping the JSONL log
-unchanged.
-
-## 4. Resume an interrupted run
-
-Use the same training arguments and point to one retained periodic checkpoint:
-
-```bash
-source .venv/bin/activate
-export CUDA_VISIBLE_DEVICES=0
-
-uv run python -m minimal_dino.train \
-  data.train_file=data/wiki1m_for_simcse.txt \
-  runtime.output_dir=runs/dino-mean-bert-base-seed42 \
-  optimization.epochs=1 \
-  optimization.batch_size=64 \
-  data.max_length=512 \
-  optimization.learning_rate=3e-5 \
-  runtime.seed=42 \
-  logging.steps=10 \
-  evaluation.steps=250 \
-  checkpoint.save_steps=500 \
-  checkpoint.keep_last=2 \
-  runtime.device=cuda \
-  checkpoint.resume_from=runs/dino-mean-bert-base-seed42/checkpoint-step-5000.pt
-```
-
-Do not change the epoch count, batch size, schedule, seed, pooling mode, MLP selection, or
-projection-head dimensions when resuming.
-
-## 5. Evaluate the student
-
-```bash
-source .venv/bin/activate
 uv run python -m minimal_dino.evaluation \
-  --checkpoint runs/dino-mean-bert-base-seed42/checkpoint.pt \
+  --checkpoint runs/byol-mean-bert-base-seed42/checkpoint.pt \
   --split validation \
-  --batch-size 64 \
   --device cuda
 ```
 
-This reads the previously downloaded STS-B split from `data/stsb`; evaluation performs no dataset
-Hub calls. It then reports Spearman/Pearson correlations, collapse diagnostics, and uniformity from
-deterministic student embeddings using the pooling mode stored in the checkpoint, plus alignment
-over STS positive pairs (score greater than 0.8). Evaluation does not truncate STS sentences. Pass
-`--stsb-dir` if the files are elsewhere.
+Do not change the training schedule or model dimensions when resuming. Evaluation uses the online
+encoder without augmentation and reports STS correlations plus collapse diagnostics.
 
-## 6. Plot training metrics
+## Hyperparameter tuning
 
-The plotting command is independent of the training process and can read `metrics.jsonl` while a
-run is still in progress:
+Run the compact Optuna tuner to maximize the best validation STS-B Spearman score. It searches
+center scale, model dropout, center momentum, and the encoder/head learning rates. Each trial gets
+its own output directory, and intermediate evaluations support median pruning.
 
 ```bash
-source .venv/bin/activate
-uv run python -m minimal_dino.plot_metrics \
-  runs/dino-mean-bert-base-seed42/metrics.jsonl \
-  --output runs/dino-mean-bert-base-seed42/metrics.png
-```
-
-By default it plots every numeric series. To select a subset, pass names prefixed with `train.` or
-`eval.` so metrics with the same raw JSON key remain distinct:
-
-```bash
-uv run python -m minimal_dino.plot_metrics \
-  runs/dino-mean-bert-base-seed42/metrics.jsonl \
-  --metrics train.loss train.lr eval.sts_spearman
-```
-
-## 7. Sweep dropout and momentum values
-
-The sweep script changes one hyperparameter at a time while holding the other settings at their
-defaults. It runs all three grids sequentially by default:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 scripts/sweep_hyperparameters.sh all
-```
-
-Pass `dropout`, `center-momentum`, or `teacher-momentum` instead of `all` to run one grid. Results
-are written below `runs/sweeps-v2`; `OUTPUT_ROOT`, `TRAIN_FILE`, and `DEVICE` can override those
-locations or the device. Additional Hydra overrides are forwarded after the sweep name, for
-example `scripts/sweep_hyperparameters.sh dropout optimization.max_steps=100` for a smoke run.
-The grids are defined near the top of the script.
-
-## 8. Tune DINO + dropout with Optuna
-
-The Optuna tuner fixes the experiment to `objective=dino` and `augmentation=dropout`, maximizes
-the best STS-B validation Spearman score observed so far, and prunes weak trials at intermediate
-evaluations. Every evaluation logs both `sts_spearman` and its running maximum
-`max_sts_spearman`; resumed runs preserve the maximum from their existing metrics log.
-It searches learning rate, batch size, weight decay, warmup ratio, encoder dropout, MLP use,
-teacher uniformization step size, student and teacher temperatures, center momentum, and
-teacher EMA momentum. It also searches DINO reset intervals over `null`, `150`, `300`, and `600`
-completed optimizer steps. A zero uniformization step size disables that teacher-head adjustment.
-Study state is stored in SQLite, so rerunning the same command resumes the study. Trial runs keep
-metrics and reproduction artifacts but skip their large final checkpoints; retrain the best
-parameters to produce a checkpoint.
-
-For a short initial study:
-
-```bash
-source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=0 uv run python -m minimal_dino.tune \
-  --n-trials 20 \
-  --output-root runs/optuna/dino-dropout \
+uv run python -m minimal_dino.tune \
   data.train_file=data/wiki1m_for_simcse.txt \
-  optimization.max_steps=2000 \
-  evaluation.steps=250 \
-  runtime.device=cuda
+  runtime.output_dir=runs/optuna \
+  optimization.max_steps=1000 \
+  evaluation.steps=100 \
+  tuning.n_trials=20
 ```
 
-Every trial must reach at least one evaluation after step 0. In particular,
-`evaluation.steps` must not exceed `optimization.max_steps` for step-limited studies. The best
-score, parameters, ready-to-copy Hydra overrides, and trial directory are written to
-`<output-root>/best_trial.json`. Fixed Hydra overrides may be appended to the command, but values
-owned by the search space cannot be overridden.
+Search ranges are configurable, for example:
 
-For a quick implementation check:
+```bash
+uv run python -m minimal_dino.tune \
+  data.train_file=data/wiki1m_for_simcse.txt \
+  tuning.search.center_scale='[0.1,0.8]' \
+  tuning.search.encoder_learning_rate='[5e-6,3e-5]'
+```
+
+## Diagnostics and tests
+
+Training logs BYOL cosine, online prediction standard deviation, target projection standard
+deviation, gradient norm, view cosine, embedding standard deviation, and pairwise cosine to
+`metrics.jsonl` and TensorBoard. Plot logs with:
+
+```bash
+uv run python -m minimal_dino.plot_metrics runs/example/metrics.jsonl
+```
+
+Run the test suite with:
 
 ```bash
 source .venv/bin/activate
 uv run pytest -q
 ```
 
-Primary references: [DINO](https://arxiv.org/abs/2104.14294), its
-[original code](https://github.com/facebookresearch/dino), [SimCSE](https://arxiv.org/abs/2104.08821),
-and its [original code](https://github.com/princeton-nlp/SimCSE).
+Primary references: [BYOL](https://arxiv.org/abs/2006.07733),
+[DINO](https://arxiv.org/abs/2104.14294), and [SimCSE](https://arxiv.org/abs/2104.08821).

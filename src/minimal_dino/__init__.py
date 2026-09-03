@@ -1,6 +1,6 @@
-"""Minimal DINO sentence embedding baseline."""
+"""Minimal BYOL sentence embedding baseline."""
 
-from minimal_dino.model import DINOHead, SentenceDINO
-from minimal_dino.objective import DINOLoss
+from minimal_dino.model import BYOLHead, SentenceBYOL
+from minimal_dino.objective import BYOLLoss
 
-__all__ = ["DINOHead", "DINOLoss", "SentenceDINO"]
+__all__ = ["BYOLHead", "BYOLLoss", "SentenceBYOL"]

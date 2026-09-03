@@ -1,7 +1,7 @@
 [project]
 name = "minimal-dino"
 version = "0.1.0"
-description = "A minimal DINO plus dropout baseline for sentence embeddings"
+description = "A minimal BYOL plus dropout baseline for sentence embeddings"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

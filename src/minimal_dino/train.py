@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import random
 import re
 import subprocess
 import warnings
-import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -18,7 +18,7 @@ import torch
 from omegaconf import DictConfig
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from minimal_dino.config import config_to_container, to_train_args
@@ -28,13 +28,14 @@ from minimal_dino.evaluation import (
     load_stsb_split,
     stsb_metrics,
 )
-from minimal_dino.model import DINOOutput, SentenceDINO, checkpoint_model_config, model_config
-from minimal_dino.objective import DINOLoss, InfoNCELoss, build_objective
+from minimal_dino.model import BYOLOutput, SentenceBYOL, checkpoint_model_config, model_config
+from minimal_dino.objective import BYOLLoss, InfoNCELoss, build_objective
 
 DEFAULT_MODEL_NAME = "bert-base-uncased"
 DEFAULT_MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 def _write_text_atomically(path: Path, content: str) -> None:
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -42,17 +43,47 @@ def _write_text_atomically(path: Path, content: str) -> None:
     temporary_path.replace(path)
 
 
-def _run_git(arguments: list[str], cwd: Path) -> str:
+def _run_git(
+    arguments: list[str],
+    cwd: Path,
+    *,
+    allowed_returncodes: tuple[int, ...] = (0,),
+) -> str:
     result = subprocess.run(
         ["git", *arguments],
         cwd=cwd,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
+    if result.returncode not in allowed_returncodes:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            result.args,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
     return result.stdout
+
+
+def _git_diff_including_untracked(repository_root: Path) -> str:
+    """Return an applicable binary patch for all tracked and untracked changes."""
+    diff = _run_git(["diff", "--binary", "HEAD", "--"], repository_root)
+    untracked_output = _run_git(
+        ["ls-files", "--others", "--exclude-standard", "-z"], repository_root
+    )
+    for relative_path in untracked_output.split("\0"):
+        if not relative_path:
+            continue
+        # `git diff --no-index` returns 1 when it finds the expected difference.
+        diff += _run_git(
+            ["diff", "--binary", "--no-index", "--", "/dev/null", relative_path],
+            repository_root,
+            allowed_returncodes=(0, 1),
+        )
+    return diff
 
 
 def save_run_artifacts(
@@ -74,8 +105,9 @@ def save_run_artifacts(
         status = _run_git(
             ["status", "--short", "--untracked-files=all"], repository_root
         ).rstrip()
-        # Comparing against HEAD includes both staged and unstaged tracked changes.
-        diff = _run_git(["diff", "--binary", "HEAD", "--"], repository_root)
+        # Comparing tracked files against HEAD includes staged and unstaged changes.
+        # New files need explicit no-index patches because regular Git diffs omit them.
+        diff = _git_diff_including_untracked(repository_root)
         git_state: dict[str, Any] = {
             "available": True,
             "commit_hash": commit_hash,
@@ -181,19 +213,15 @@ def cosine_teacher_momentum(step: int, total_steps: int, base_momentum: float) -
     return 1.0 - (1.0 - base_momentum) * (math.cos(math.pi * progress) + 1.0) / 2.0
 
 
-def teacher_temperature(
-    step: int, warmup_steps: int, warmup_temperature: float, temperature: float
-) -> float:
-    if warmup_steps <= 0 or step >= warmup_steps:
-        return temperature
-    alpha = step / max(1, warmup_steps - 1)
-    return warmup_temperature + alpha * (temperature - warmup_temperature)
+def set_encoder_trainable(model: SentenceBYOL, trainable: bool) -> None:
+    """Freeze or unfreeze only the online encoder, leaving the BYOL head trainable."""
+    model.encoder.requires_grad_(trainable)
 
 
 @torch.no_grad()
 def update_teacher(
-    student: SentenceDINO,
-    teacher: SentenceDINO,
+    student: SentenceBYOL,
+    teacher: SentenceBYOL,
     momentum: float,
     *,
     use_foreach: bool = False,
@@ -223,21 +251,6 @@ def update_teacher(
         teacher_buffer.copy_(student_buffers[name])
 
 
-@torch.no_grad()
-def reset_dino_state(
-    student: SentenceDINO, teacher: SentenceDINO, objective: DINOLoss
-) -> None:
-    """Reinitialize the student DINO head, synchronize it, and clear the center."""
-    student.head.reset_parameters()
-    update_teacher(student, teacher, momentum=0.0, use_foreach=True)
-    objective.center.zero_()
-
-
-def is_dino_reset_step(completed_step: int, reset_interval: int | None) -> bool:
-    """Return whether a completed optimizer step is a configured reset boundary."""
-    return reset_interval is not None and completed_step % reset_interval == 0
-
-
 def off_diagonal_cosine(embeddings: torch.Tensor) -> torch.Tensor:
     if embeddings.shape[0] < 2:
         return embeddings.new_tensor(float("nan"))
@@ -249,9 +262,9 @@ def off_diagonal_cosine(embeddings: torch.Tensor) -> torch.Tensor:
 
 def save_checkpoint(
     output_dir: Path,
-    student: SentenceDINO,
-    teacher: SentenceDINO,
-    objective: DINOLoss | InfoNCELoss,
+    student: SentenceBYOL,
+    teacher: SentenceBYOL,
+    objective: BYOLLoss | InfoNCELoss,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     tokenizer: Any,
@@ -268,7 +281,7 @@ def save_checkpoint(
         {
             "student": student.state_dict(),
             "teacher": teacher.state_dict(),
-            "objective_name": getattr(args, "objective", "dino"),
+            "objective_name": args.objective,
             "objective": objective.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -294,15 +307,15 @@ def save_checkpoint(
 
 def restore_checkpoint(
     checkpoint_path: str | Path,
-    student: SentenceDINO,
-    teacher: SentenceDINO,
-    objective: DINOLoss | InfoNCELoss,
+    student: SentenceBYOL,
+    teacher: SentenceBYOL,
+    objective: BYOLLoss | InfoNCELoss,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     device: torch.device,
 ) -> int:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    checkpoint_objective = checkpoint.get("objective_name", "dino")
+    checkpoint_objective = checkpoint["objective_name"]
     if checkpoint_objective != objective_name(objective):
         raise ValueError(
             f"Checkpoint objective is {checkpoint_objective}, but this run uses "
@@ -310,13 +323,7 @@ def restore_checkpoint(
         )
     checkpoint_head_config = checkpoint_model_config(checkpoint)
     expected_head_config = model_config(student)
-    compared_keys = {"output_dim", "pooling", "use_mlp", "uniformity_step_size"}
-    if expected_head_config["use_mlp"]:
-        compared_keys.update({"head_hidden_dim", "bottleneck_dim"})
-    if any(
-        checkpoint_head_config[name] != expected_head_config[name]
-        for name in compared_keys
-    ):
+    if checkpoint_head_config != expected_head_config:
         raise ValueError("Checkpoint projection-head configuration does not match this run")
     student.load_state_dict(checkpoint["student"])
     teacher.load_state_dict(checkpoint["teacher"])
@@ -331,9 +338,9 @@ def restore_checkpoint(
     return int(checkpoint["step"])
 
 
-def objective_name(objective: DINOLoss | InfoNCELoss) -> str:
-    if isinstance(objective, DINOLoss):
-        return "dino"
+def objective_name(objective: BYOLLoss | InfoNCELoss) -> str:
+    if isinstance(objective, BYOLLoss):
+        return "byol"
     if isinstance(objective, InfoNCELoss):
         return "infonce"
     raise TypeError(f"Unsupported objective type: {type(objective).__name__}")
@@ -359,47 +366,38 @@ def train(
 
     if not 0.0 <= args.augmentation_strength <= 1.0:
         raise ValueError("augmentation_strength must be in [0, 1]")
-    dino_reset_interval = getattr(args, "dino_reset_interval", None)
-    if dino_reset_interval is not None and (
-        isinstance(dino_reset_interval, bool)
-        or not isinstance(dino_reset_interval, int)
-        or dino_reset_interval < 1
-    ):
-        raise ValueError("objective.reset_interval must be null or a positive integer")
     device = torch.device(args.device)
     args.model_revision = resolve_model_revision(args.model_name, args.model_revision)
     save_run_artifacts(args.output_dir, run_config if run_config is not None else args)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, revision=args.model_revision)
     model_factory = (
-        SentenceDINO.from_random_init if args.random_init else SentenceDINO.from_pretrained
+        SentenceBYOL.from_random_init if args.random_init else SentenceBYOL.from_pretrained
     )
     student = model_factory(
         args.model_name,
         revision=args.model_revision,
         dropout=args.dropout,
         pooling=args.pooling,
-        use_mlp=args.use_mlp,
-        output_dim=args.output_dim,
-        head_hidden_dim=args.head_hidden_dim,
-        bottleneck_dim=args.bottleneck_dim,
-        uniformity_step_size=args.uniformity_step_size,
+        projection_dim=args.projection_dim,
+        projector_hidden_dim=args.projector_hidden_dim,
+        predictor_hidden_dim=args.predictor_hidden_dim,
     ).to(device)
     teacher = copy.deepcopy(student).to(device).eval()
     teacher.requires_grad_(False)
     objective = build_objective(
         args.objective,
-        output_dim=args.output_dim,
-        student_temp=args.student_temp,
+        projection_dim=args.projection_dim,
+        embedding_dim=student.head.input_dim,
         center_momentum=args.center_momentum,
         infonce_temp=args.infonce_temp,
     ).to(device)
-    dino_precision = getattr(args, "dino_precision", "bf16")
-    if dino_precision not in {"fp32", "bf16"}:
-        raise ValueError("runtime.dino_precision must be 'fp32' or 'bf16'")
-    optimize_dino_cuda = isinstance(objective, DINOLoss) and device.type == "cuda"
-    use_dino_bf16 = optimize_dino_cuda and dino_precision == "bf16"
-    if use_dino_bf16 and not torch.cuda.is_bf16_supported():
-        raise RuntimeError("runtime.dino_precision=bf16 requires a BF16-capable CUDA device")
+    byol_precision = args.byol_precision
+    if byol_precision not in {"fp32", "bf16"}:
+        raise ValueError("runtime.byol_precision must be 'fp32' or 'bf16'")
+    optimize_byol_cuda = isinstance(objective, BYOLLoss) and device.type == "cuda"
+    use_byol_bf16 = optimize_byol_cuda and byol_precision == "bf16"
+    if use_byol_bf16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("runtime.byol_precision=bf16 requires a BF16-capable CUDA device")
 
     if not all(torch.equal(a, b) for a, b in zip(student.parameters(), teacher.parameters())):
         raise RuntimeError("Teacher was not initialized exactly from the student")
@@ -424,9 +422,9 @@ def train(
         num_workers=args.num_workers,
         generator=generator,
         drop_last=False,
-        pin_memory=optimize_dino_cuda,
+        pin_memory=optimize_byol_cuda,
         persistent_workers=(
-            isinstance(objective, DINOLoss)
+            isinstance(objective, BYOLLoss)
             and args.augmentation == "dropout"
             and args.num_workers > 0
         ),
@@ -437,13 +435,24 @@ def train(
     if total_steps < 1:
         raise ValueError("Training requires at least one optimizer step")
 
-    optimizer_kwargs = {
-        "lr": args.learning_rate,
-        "weight_decay": args.weight_decay,
-    }
-    if optimize_dino_cuda:
+    optimizer_kwargs = {"weight_decay": args.weight_decay}
+    if optimize_byol_cuda:
         optimizer_kwargs["fused"] = True
-    optimizer = torch.optim.AdamW(student.parameters(), **optimizer_kwargs)
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": student.encoder.parameters(),
+                "lr": args.encoder_learning_rate,
+                "name": "encoder",
+            },
+            {
+                "params": student.head.parameters(),
+                "lr": args.head_learning_rate,
+                "name": "head",
+            },
+        ],
+        **optimizer_kwargs,
+    )
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
@@ -506,6 +515,7 @@ def train(
             evaluation_callback(0, step_zero_eval_metrics)
     dropout_views_checked = False
     collapse_warning_emitted = False
+    set_encoder_trainable(student, global_step >= args.encoder_freeze_steps)
     student.train()
     optimizer.zero_grad(set_to_none=True)
     start_epoch = global_step // steps_per_epoch
@@ -518,54 +528,75 @@ def train(
         for batch_index, batch in enumerate(loader):
             if epoch == start_epoch and batch_index < resume_batch:
                 continue
+            if global_step == args.encoder_freeze_steps:
+                set_encoder_trainable(student, True)
             completed_step = global_step + 1
             should_log = completed_step == 1 or completed_step % args.log_steps == 0
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
-                enabled=use_dino_bf16,
+                enabled=use_byol_bf16,
             ):
                 if args.augmentation == "dropout":
                     batch = {
-                        name: value.to(device, non_blocking=optimize_dino_cuda)
+                        name: value.to(device, non_blocking=optimize_byol_cuda)
                         for name, value in batch.items()
                     }
-                    if isinstance(objective, DINOLoss):
+                    if isinstance(objective, BYOLLoss):
                         batch_size = next(iter(batch.values())).shape[0]
                         combined_batch = {
                             name: torch.cat((value, value), dim=0) for name, value in batch.items()
                         }
                         combined_student = student(**combined_batch, use_dropout=True)
-                        student_view1 = DINOOutput(
+                        student_view1 = BYOLOutput(
                             embedding=combined_student.embedding[:batch_size],
-                            logits=combined_student.logits[:batch_size],
+                            projection=combined_student.projection[:batch_size],
+                            prediction=combined_student.prediction[:batch_size],
                         )
-                        student_view2 = DINOOutput(
+                        student_view2 = BYOLOutput(
                             embedding=combined_student.embedding[batch_size:],
-                            logits=combined_student.logits[batch_size:],
+                            projection=combined_student.projection[batch_size:],
+                            prediction=combined_student.prediction[batch_size:],
                         )
-                        # The EMA teacher is in eval mode with dropout disabled, so both
-                        # global views are exactly the same for dropout augmentation.
+                        # Target views use independent, lower-rate dropout masks.
                         with torch.no_grad():
                             teacher_view1 = teacher(
-                                **batch, use_dropout=False, is_teacher=True
+                                **batch,
+                                use_dropout=True,
+                                dropout_probability=args.target_dropout,
+                                target=True,
+                                center=objective.center,
+                                center_scale=args.center_scale,
                             )
-                        teacher_view2 = teacher_view1
+                            teacher_view2 = teacher(
+                                **batch,
+                                use_dropout=True,
+                                dropout_probability=args.target_dropout,
+                                target=True,
+                                center=objective.center,
+                                center_scale=args.center_scale,
+                            )
                     else:
                         # Keep the existing InfoNCE execution path unchanged.
                         student_view1 = student(**batch, use_dropout=True)
                         student_view2 = student(**batch, use_dropout=True)
                         with torch.no_grad():
                             teacher_view1 = teacher(
-                                **batch, use_dropout=False, is_teacher=True
+                                **batch,
+                                use_dropout=True,
+                                dropout_probability=args.target_dropout,
+                                target=True,
                             )
                             teacher_view2 = teacher(
-                                **batch, use_dropout=False, is_teacher=True
+                                **batch,
+                                use_dropout=True,
+                                dropout_probability=args.target_dropout,
+                                target=True,
                             )
                 else:
                     view1, view2 = (
                         {
-                            name: value.to(device, non_blocking=optimize_dino_cuda)
+                            name: value.to(device, non_blocking=optimize_byol_cuda)
                             for name, value in view.items()
                         }
                         for view in batch
@@ -573,27 +604,34 @@ def train(
                     student_view1 = student(**view1, use_dropout=False)
                     student_view2 = student(**view2, use_dropout=False)
                     with torch.no_grad():
-                        teacher_view1 = teacher(**view1, use_dropout=False, is_teacher=True)
-                        teacher_view2 = teacher(**view2, use_dropout=False, is_teacher=True)
+                        teacher_view1 = teacher(
+                            **view1,
+                            use_dropout=False,
+                            target=True,
+                            center=objective.center if isinstance(objective, BYOLLoss) else None,
+                            center_scale=args.center_scale,
+                        )
+                        teacher_view2 = teacher(
+                            **view2,
+                            use_dropout=False,
+                            target=True,
+                            center=objective.center if isinstance(objective, BYOLLoss) else None,
+                            center_scale=args.center_scale,
+                        )
 
-                temperature = teacher_temperature(
-                    global_step,
-                    args.teacher_temp_warmup_steps,
-                    args.warmup_teacher_temp,
-                    args.teacher_temp,
-                )
-                if isinstance(objective, DINOLoss):
+                if isinstance(objective, BYOLLoss):
+                    if student_view1.prediction is None or student_view2.prediction is None:
+                        raise RuntimeError("Online BYOL views must contain predictions")
                     loss, loss_metrics = objective(
-                        (student_view1.logits, student_view2.logits),
-                        (teacher_view1.logits, teacher_view2.logits),
-                        temperature,
+                        (student_view1.prediction, student_view2.prediction),
+                        (teacher_view1.projection, teacher_view2.projection),
                         compute_metrics=should_log,
                     )
                 else:
                     loss, loss_metrics = objective(
                         (student_view1.embedding, student_view2.embedding)
                     )
-            if optimize_dino_cuda:
+            if optimize_byol_cuda:
                 torch._assert_async(
                     torch.isfinite(loss), f"Non-finite loss at step {global_step}"
                 )
@@ -604,26 +642,19 @@ def train(
             optimizer.step()
             scheduler.step()
 
-            should_reset_dino = (
-                isinstance(objective, DINOLoss)
-                and is_dino_reset_step(global_step + 1, dino_reset_interval)
+            momentum = cosine_teacher_momentum(
+                global_step, total_steps, args.teacher_momentum
             )
-            if should_reset_dino:
-                optimizer.state.clear()
-                reset_dino_state(student, teacher, objective)
-                momentum = 0.0
-            else:
-                momentum = cosine_teacher_momentum(
-                    global_step, total_steps, args.teacher_momentum
+            update_teacher(
+                student,
+                teacher,
+                momentum,
+                use_foreach=isinstance(objective, BYOLLoss),
+            )
+            if isinstance(objective, BYOLLoss):
+                objective.update_center(
+                    (teacher_view1.embedding, teacher_view2.embedding)
                 )
-                update_teacher(
-                    student,
-                    teacher,
-                    momentum,
-                    use_foreach=isinstance(objective, DINOLoss),
-                )
-                if isinstance(objective, DINOLoss):
-                    objective.update_center((teacher_view1.logits, teacher_view2.logits))
             optimizer.zero_grad(set_to_none=True)
 
             if args.augmentation == "dropout" and not dropout_views_checked:
@@ -664,9 +695,10 @@ def train(
                 log = {
                     "step": global_step,
                     "loss": loss.item(),
-                    "lr": scheduler.get_last_lr()[0],
+                    "encoder_lr": scheduler.get_last_lr()[0],
+                    "head_lr": scheduler.get_last_lr()[1],
+                    "encoder_frozen": int(global_step <= args.encoder_freeze_steps),
                     "teacher_momentum": momentum,
-                    "teacher_temp": temperature,
                     "grad_norm": float(grad_norm),
                     "student_view_cosine": student_view_cosine.item(),
                     "teacher_view_cosine": teacher_view_cosine.item(),

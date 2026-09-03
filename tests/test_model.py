@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from minimal_dino.model import SentenceDINO
+from minimal_dino.model import BYOLHead, SentenceBYOL
 
 
 class TinyEncoder(nn.Module):
@@ -20,15 +20,27 @@ class TinyEncoder(nn.Module):
         return SimpleNamespace(last_hidden_state=hidden)
 
 
+def make_model(**kwargs):
+    return SentenceBYOL(
+        TinyEncoder(dropout=kwargs.pop("dropout", 0.0)),
+        projection_dim=8,
+        projector_hidden_dim=24,
+        predictor_hidden_dim=16,
+        **kwargs,
+    )
+
+
 def test_dropout_views_are_independent_and_encode_is_deterministic():
     torch.manual_seed(0)
-    model = SentenceDINO(TinyEncoder(), output_dim=16, head_hidden_dim=24, bottleneck_dim=8)
+    model = SentenceBYOL(
+        TinyEncoder(), projection_dim=8, projector_hidden_dim=24, predictor_hidden_dim=16
+    )
     batch = {
         "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
         "attention_mask": torch.ones(2, 3, dtype=torch.long),
     }
 
-    model.eval()  # Dropout views must work even for the eval-mode EMA teacher.
+    model.eval()
     view1 = model(**batch, use_dropout=True).embedding
     view2 = model(**batch, use_dropout=True).embedding
     deterministic1 = model.encode(**batch)
@@ -40,10 +52,8 @@ def test_dropout_views_are_independent_and_encode_is_deterministic():
     assert model.encoder.dropout.training is False
 
 
-def test_sentence_embedding_is_masked_mean_before_projection_head():
-    model = SentenceDINO(
-        TinyEncoder(dropout=0.0), output_dim=16, head_hidden_dim=24, bottleneck_dim=8
-    )
+def test_sentence_embedding_is_masked_mean_before_byol_head():
+    model = make_model()
     batch = {
         "input_ids": torch.tensor([[1, 2, 0]]),
         "attention_mask": torch.tensor([[1, 1, 0]]),
@@ -54,17 +64,95 @@ def test_sentence_embedding_is_masked_mean_before_projection_head():
     output = model(**batch, use_dropout=False)
 
     assert torch.equal(output.embedding, expected)
-    assert output.logits.shape == (1, 16)
+    assert output.projection.shape == (1, 8)
+    assert output.prediction is not None
+    assert output.prediction.shape == (1, 8)
+
+
+def test_target_branch_skips_predictor(monkeypatch):
+    model = make_model().eval()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+    }
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("target branch must not call the predictor")
+
+    monkeypatch.setattr(model.head, "predict", fail_if_called)
+    output = model(**batch, use_dropout=False, target=True)
+
+    assert output.prediction is None
+    assert torch.isfinite(output.projection).all()
+
+
+def test_target_center_is_applied_before_projection_with_configured_scale(monkeypatch):
+    model = make_model().eval()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+    }
+    center = torch.arange(12, dtype=torch.float32).unsqueeze(0)
+    projector_input = None
+
+    def capture_input(module, args):
+        nonlocal projector_input
+        projector_input = args[0].detach().clone()
+
+    handle = model.head.projector.register_forward_pre_hook(capture_input)
+    output = model(
+        **batch, use_dropout=False, target=True, center=center, center_scale=0.25
+    )
+    handle.remove()
+
+    assert torch.equal(projector_input, output.embedding.float() - center * 0.25)
+
+
+def test_center_is_rejected_for_online_branch():
+    model = make_model()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+    }
+
+    with pytest.raises(ValueError, match="target branch"):
+        model(**batch, use_dropout=False, center=torch.zeros(1, 12))
+
+
+def test_target_dropout_uses_override_and_restores_module(monkeypatch):
+    model = SentenceBYOL(
+        TinyEncoder(dropout=0.5),
+        projection_dim=8,
+        projector_hidden_dim=24,
+        predictor_hidden_dim=16,
+    ).eval()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        "attention_mask": torch.ones(2, 3, dtype=torch.long),
+    }
+    observed = []
+    original_forward = model.encoder.dropout.forward
+
+    def record_probability(value):
+        observed.append(model.encoder.dropout.p)
+        return original_forward(value)
+
+    monkeypatch.setattr(model.encoder.dropout, "forward", record_probability)
+    first = model(
+        **batch, use_dropout=True, dropout_probability=0.05, target=True
+    ).projection
+    second = model(
+        **batch, use_dropout=True, dropout_probability=0.05, target=True
+    ).projection
+
+    assert observed == [0.05, 0.05]
+    assert not torch.equal(first, second)
+    assert model.encoder.dropout.p == 0.5
+    assert model.encoder.dropout.training is False
 
 
 def test_sentence_embedding_can_use_cls_pooling():
-    model = SentenceDINO(
-        TinyEncoder(dropout=0.0),
-        output_dim=16,
-        head_hidden_dim=24,
-        bottleneck_dim=8,
-        pooling="cls",
-    )
+    model = make_model(pooling="cls")
     batch = {
         "input_ids": torch.tensor([[1, 2, 0]]),
         "attention_mask": torch.tensor([[1, 1, 0]]),
@@ -76,79 +164,27 @@ def test_sentence_embedding_can_use_cls_pooling():
     assert torch.equal(output.embedding, hidden[:, 0, :])
 
 
-@pytest.mark.parametrize("use_mlp", [True, False])
-def test_projection_head_can_enable_or_disable_mlp(use_mlp):
-    model = SentenceDINO(
-        TinyEncoder(dropout=0.0),
-        output_dim=16,
-        head_hidden_dim=24,
-        bottleneck_dim=8,
-        use_mlp=use_mlp,
-    ).eval()
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3]]),
-        "attention_mask": torch.ones(1, 3, dtype=torch.long),
-    }
+def test_byol_head_has_distinct_projector_and_predictor():
+    head = BYOLHead(12, projection_dim=8, projector_hidden_dim=24, predictor_hidden_dim=16)
+    embedding = torch.randn(1, 12)
 
-    output = model(**batch, use_dropout=False, is_teacher=True)
+    projection = head.project(embedding)
+    prediction = head.predict(projection)
 
-    expected_projection_dim = 8 if use_mlp else 12
-    assert model.head.last_weight.shape == (16, expected_projection_dim)
-    assert torch.isfinite(output.logits).all()
+    assert projection.shape == prediction.shape == (1, 8)
+    assert head.projector[0].in_features == 12
+    assert head.predictor[0].in_features == 8
 
 
-def test_teacher_head_uses_configured_uniformity_step_size(monkeypatch):
-    model = SentenceDINO(
-        TinyEncoder(dropout=0.0),
-        output_dim=16,
-        uniformity_step_size=0.05,
-    ).eval()
-    captured = {}
-
-    def record_uniformization(embedding, step_size):
-        captured["step_size"] = step_size
-        return embedding
-
-    monkeypatch.setattr(model.head, "uniformize_embedding", record_uniformization)
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
-        "attention_mask": torch.ones(2, 3, dtype=torch.long),
-    }
-
-    model(**batch, use_dropout=False, is_teacher=True)
-
-    assert captured["step_size"] == 0.05
+@pytest.mark.parametrize("name", ["projection_dim", "projector_hidden_dim", "predictor_hidden_dim"])
+def test_byol_head_rejects_invalid_dimensions(name):
+    with pytest.raises(ValueError, match=name):
+        BYOLHead(12, **{name: 0})
 
 
-def test_zero_uniformity_step_size_disables_teacher_adjustment(monkeypatch):
-    model = SentenceDINO(
-        TinyEncoder(dropout=0.0),
-        output_dim=16,
-        uniformity_step_size=0.0,
-    ).eval()
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("uniformization must be disabled")
-
-    monkeypatch.setattr(model.head, "uniformize_embedding", fail_if_called)
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
-        "attention_mask": torch.ones(2, 3, dtype=torch.long),
-    }
-
-    output = model(**batch, use_dropout=False, is_teacher=True)
-
-    assert torch.isfinite(output.logits).all()
-
-
-def test_sentence_dino_rejects_negative_uniformity_step_size():
-    with pytest.raises(ValueError, match="uniformity_step_size"):
-        SentenceDINO(TinyEncoder(), uniformity_step_size=-0.01)
-
-
-def test_sentence_dino_rejects_invalid_pooling():
+def test_sentence_byol_rejects_invalid_pooling():
     with pytest.raises(ValueError, match="pooling"):
-        SentenceDINO(TinyEncoder(), pooling="max")
+        SentenceBYOL(TinyEncoder(), pooling="max")
 
 
 def test_from_pretrained_passes_revision_and_dropout(monkeypatch):
@@ -159,9 +195,8 @@ def test_from_pretrained_passes_revision_and_dropout(monkeypatch):
         return TinyEncoder()
 
     monkeypatch.setattr("minimal_dino.model.AutoModel.from_pretrained", fake_from_pretrained)
-
-    SentenceDINO.from_pretrained(
-        "example/model", revision="immutable-commit", dropout=0.2, output_dim=16
+    SentenceBYOL.from_pretrained(
+        "example/model", revision="immutable-commit", dropout=0.2, projection_dim=8
     )
 
     assert captured == {
@@ -174,7 +209,7 @@ def test_from_pretrained_passes_revision_and_dropout(monkeypatch):
 
 def test_from_pretrained_rejects_invalid_dropout():
     with pytest.raises(ValueError, match="dropout must be"):
-        SentenceDINO.from_pretrained("example/model", dropout=1.0)
+        SentenceBYOL.from_pretrained("example/model", dropout=1.0)
 
 
 def test_from_random_init_loads_only_config_and_applies_dropout(monkeypatch):
@@ -189,19 +224,17 @@ def test_from_random_init_loads_only_config_and_applies_dropout(monkeypatch):
         captured["model_config"] = actual_config
         return TinyEncoder()
 
-    def fail_if_pretrained_is_loaded(*args, **kwargs):
-        raise AssertionError("pretrained weights must not be loaded")
-
     monkeypatch.setattr(
         "minimal_dino.model.AutoConfig.from_pretrained", fake_config_from_pretrained
     )
     monkeypatch.setattr("minimal_dino.model.AutoModel.from_config", fake_model_from_config)
     monkeypatch.setattr(
-        "minimal_dino.model.AutoModel.from_pretrained", fail_if_pretrained_is_loaded
+        "minimal_dino.model.AutoModel.from_pretrained",
+        lambda *args, **kwargs: pytest.fail("pretrained weights must not be loaded"),
     )
 
-    SentenceDINO.from_random_init(
-        "example/model", revision="immutable-commit", dropout=0.2, output_dim=16
+    SentenceBYOL.from_random_init(
+        "example/model", revision="immutable-commit", dropout=0.2, projection_dim=8
     )
 
     assert captured == {
@@ -217,4 +250,4 @@ def test_from_random_init_loads_only_config_and_applies_dropout(monkeypatch):
 
 def test_from_random_init_rejects_invalid_dropout():
     with pytest.raises(ValueError, match="dropout must be"):
-        SentenceDINO.from_random_init("example/model", dropout=1.0)
+        SentenceBYOL.from_random_init("example/model", dropout=1.0)
