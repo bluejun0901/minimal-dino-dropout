@@ -1,7 +1,7 @@
 epochs: 1
 batch_size: 64
-encoder_learning_rate: 0.1e-5
-head_learning_rate: 1.0e-4
+encoder_learning_rate: 3.05e-06
+head_learning_rate: 2.97e-04
 encoder_freeze_steps: 150
 weight_decay: 0.01
 warmup_ratio: 0.1

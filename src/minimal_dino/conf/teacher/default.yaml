@@ -1,2 +1,2 @@
 dropout: 0.02
-momentum: 0.999
+momentum: 0.992
