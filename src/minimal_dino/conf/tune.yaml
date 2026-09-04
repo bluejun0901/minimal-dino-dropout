@@ -12,20 +12,14 @@ defaults:
   - _self_
 
 tuning:
-  study_name: minimal-dino
-  storage: sqlite:///${runtime.output_dir}/optuna.db
-  n_trials: 20
+  study_name: minimal-dino-first
+  storage: sqlite:///runs/optuna/optuna.db
+  n_trials: 150
   timeout: null
   metric: sts_spearman
   sampler_seed: 42
-  pruner_startup_trials: 5
-  pruner_warmup_steps: 200
-  search:
-    center_scale: [0.0, 1.0]
-    model_dropout: [0.05, 0.3]
-    center_momentum: [0.9, 0.999]
-    encoder_learning_rate: [1.0e-6, 5.0e-5]
-    head_learning_rate: [1.0e-5, 1.0e-3]
+  pruner_startup_trials: 10
+  pruner_warmup_steps: 1500
 
 hydra:
   run:

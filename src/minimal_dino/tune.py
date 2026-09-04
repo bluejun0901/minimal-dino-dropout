@@ -15,30 +15,31 @@ from minimal_dino.train import train
 
 
 def sample_config(config: DictConfig, trial: optuna.Trial) -> DictConfig:
-    """Return a per-trial training config with the five requested parameters sampled."""
+    """Return a per-trial training config with the requested parameters sampled."""
     trial_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
-    search = config.tuning.search
 
-    dropout_low, dropout_high = search.model_dropout
-    # ``to_train_args`` requires target dropout to be strictly lower than model dropout.
-    dropout_low = max(float(dropout_low), float(config.teacher.dropout) + 1e-6)
-    if dropout_low > dropout_high:
-        raise ValueError("model_dropout search range must include values above teacher.dropout")
-
-    trial_config.objective.center_scale = trial.suggest_float(
-        "center_scale", *search.center_scale
-    )
-    trial_config.model.dropout = trial.suggest_float(
-        "model_dropout", dropout_low, float(dropout_high)
-    )
-    trial_config.objective.center_momentum = trial.suggest_float(
-        "center_momentum", *search.center_momentum
-    )
     trial_config.optimization.encoder_learning_rate = trial.suggest_float(
-        "encoder_learning_rate", *search.encoder_learning_rate, log=True
+        "encoder_learning_rate", 2e-7, 5e-6, log=True
     )
     trial_config.optimization.head_learning_rate = trial.suggest_float(
-        "head_learning_rate", *search.head_learning_rate, log=True
+        "head_learning_rate", 3e-5, 3e-4, log=True
+    )
+    trial_config.model.dropout = trial.suggest_float("dropout", 0.12, 0.35)
+    trial_config.objective.center_scale = trial.suggest_categorical(
+        "center_scale", [0.0, 0.05, 0.1, 0.2, 0.3, 0.4]
+    )
+    trial_config.objective.center_momentum = trial.suggest_float(
+        "center_momentum", 0.80, 0.99
+    )
+    teacher_one_minus_momentum = trial.suggest_float(
+        "teacher_one_minus_momentum", 1e-4, 1e-2, log=True
+    )
+    trial_config.teacher.momentum = 1.0 - teacher_one_minus_momentum
+    trial_config.optimization.encoder_freeze_steps = trial.suggest_categorical(
+        "encoder_freeze_steps", [100, 150, 200, 300, 400]
+    )
+    trial_config.optimization.warmup_ratio = trial.suggest_float(
+        "warmup_ratio", 0.03, 0.15
     )
     return trial_config
 
