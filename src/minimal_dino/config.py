@@ -24,8 +24,20 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
     runtime = _section(values, "runtime")
     logging = _section(values, "logging")
 
-    if augmentation["name"] not in {"dropout", "word"}:
-        raise ValueError("augmentation.name must be 'dropout' or 'word'")
+    augmentations = augmentation["names"]
+    if (
+        not isinstance(augmentations, list)
+        or not augmentations
+        or any(
+            not isinstance(name, str) or name not in {"dropout", "word"}
+            for name in augmentations
+        )
+        or len(set(augmentations)) != len(augmentations)
+    ):
+        raise ValueError(
+            "augmentation.names must be a non-empty list containing unique "
+            "'dropout' and/or 'word' values"
+        )
     if objective["name"] not in {"byol", "infonce"}:
         raise ValueError("objective.name must be 'byol' or 'infonce'")
     if model["pooling"] not in {"cls", "mean"}:
@@ -84,7 +96,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         projection_dim=model["projection_dim"],
         projector_hidden_dim=model["projector_hidden_dim"],
         predictor_hidden_dim=model["predictor_hidden_dim"],
-        augmentation=augmentation["name"],
+        augmentation=augmentations,
         augmentation_strength=augmentation["strength"],
         objective=objective["name"],
         center_momentum=center_momentum,

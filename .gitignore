@@ -60,6 +60,7 @@ reports/*.html
 *.log
 logs/
 runs/
+archive/
 
 # Environment variables
 
@@ -69,3 +70,4 @@ Thumbs.db
 
 # utility
 utils/
+
