@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import torch
 from torch import nn
@@ -172,6 +172,7 @@ class SentenceBYOL(nn.Module):
         target: bool = False,
         center: torch.Tensor | None = None,
         center_scale: float = 0.5,
+        target_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> BYOLOutput:
         with dropout_mode(self.encoder, use_dropout, dropout_probability):
             hidden = self.encoder(
@@ -184,7 +185,11 @@ class SentenceBYOL(nn.Module):
         else:
             mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
             embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        if center is not None:
+        if target_transform is not None:
+            if not target or center is not None:
+                raise ValueError("target_transform requires target=True and center=None")
+            projection_input = target_transform(embedding)
+        elif center is not None:
             if not target:
                 raise ValueError("center can only be applied to the target branch")
             if center.shape != (1, self.head.input_dim):

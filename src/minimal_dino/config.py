@@ -6,6 +6,8 @@ from typing import Any
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from minimal_dino.geometry import GeometryConfig
+
 
 def to_train_args(config: DictConfig) -> SimpleNamespace:
     """Translate the grouped Hydra config at the training-loop boundary."""
@@ -76,6 +78,11 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         or center_scale < 0.0
     ):
         raise ValueError("objective.center_scale must be a non-negative number")
+    target_geometry = objective.get("target_geometry")
+    if target_geometry is not None:
+        if objective["name"] != "byol" or not isinstance(target_geometry, dict):
+            raise ValueError("objective.target_geometry requires BYOL and a mapping")
+        GeometryConfig(**target_geometry)
 
     device = runtime["device"]
     if device == "auto":
@@ -101,6 +108,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         objective=objective["name"],
         center_momentum=center_momentum,
         center_scale=center_scale,
+        target_geometry=target_geometry,
         infonce_temp=objective.get("temperature", 0.05),
         epochs=optimization["epochs"],
         max_steps=optimization["max_steps"],

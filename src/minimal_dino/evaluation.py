@@ -74,12 +74,22 @@ def embedding_diagnostics(
     singular_values = torch.linalg.svdvals(embeddings.float() - embeddings.float().mean(0))
     probabilities = singular_values / singular_values.sum().clamp_min(1e-12)
     effective_rank = torch.exp(-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).item()
+    energy = singular_values.square()
+    total_energy = energy.sum()
+    energy_share = energy / total_energy.clamp_min(1e-12)
+    if total_energy == 0:
+        effective_rank = 0.0
     return {
         "embedding_std": embeddings.float().std(dim=0, unbiased=False).mean().item(),
         "pairwise_cosine_mean": pairwise_mean,
         "pairwise_cosine_std": pairwise_std,
         "uniformity": uniformity,
         "effective_rank": effective_rank,
+        "covariance_top1_mass": energy_share[:1].sum().item(),
+        "covariance_top10_mass": energy_share[:10].sum().item(),
+        "participation_ratio": (
+            total_energy.square() / energy.square().sum().clamp_min(1e-24)
+        ).item(),
     }
 
 

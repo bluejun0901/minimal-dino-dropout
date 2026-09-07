@@ -8,6 +8,7 @@ import random
 import re
 import subprocess
 import warnings
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -28,6 +29,7 @@ from minimal_dino.evaluation import (
     load_stsb_split,
     stsb_metrics,
 )
+from minimal_dino.geometry import GeometryConfig
 from minimal_dino.model import BYOLOutput, SentenceBYOL, checkpoint_model_config, model_config
 from minimal_dino.objective import BYOLLoss, InfoNCELoss, build_objective
 
@@ -325,6 +327,15 @@ def restore_checkpoint(
     expected_head_config = model_config(student)
     if checkpoint_head_config != expected_head_config:
         raise ValueError("Checkpoint projection-head configuration does not match this run")
+    saved_geometry = checkpoint.get("args", {}).get("target_geometry")
+    saved_geometry_config = GeometryConfig(**saved_geometry) if saved_geometry is not None else None
+    current_geometry_config = (
+        objective.geometry.config
+        if isinstance(objective, BYOLLoss) and objective.geometry is not None
+        else None
+    )
+    if saved_geometry_config != current_geometry_config:
+        raise ValueError("Checkpoint target geometry configuration does not match this run")
     student.load_state_dict(checkpoint["student"])
     teacher.load_state_dict(checkpoint["teacher"])
     objective.load_state_dict(checkpoint["objective"])
@@ -390,7 +401,13 @@ def train(
         embedding_dim=student.head.input_dim,
         center_momentum=args.center_momentum,
         infonce_temp=args.infonce_temp,
+        target_geometry=getattr(args, "target_geometry", None),
     ).to(device)
+    target_transform = (
+        partial(objective.transform_target, center_scale=args.center_scale)
+        if isinstance(objective, BYOLLoss)
+        else None
+    )
     byol_precision = args.byol_precision
     if byol_precision not in {"fp32", "bf16"}:
         raise ValueError("runtime.byol_precision must be 'fp32' or 'bf16'")
@@ -565,16 +582,14 @@ def train(
                                 use_dropout=True,
                                 dropout_probability=args.target_dropout,
                                 target=True,
-                                center=objective.center,
-                                center_scale=args.center_scale,
+                                target_transform=target_transform,
                             )
                             teacher_view2 = teacher(
                                 **batch,
                                 use_dropout=True,
                                 dropout_probability=args.target_dropout,
                                 target=True,
-                                center=objective.center,
-                                center_scale=args.center_scale,
+                                target_transform=target_transform,
                             )
                     else:
                         # Keep the existing InfoNCE execution path unchanged.
@@ -608,15 +623,13 @@ def train(
                             **view1,
                             use_dropout=False,
                             target=True,
-                            center=objective.center if isinstance(objective, BYOLLoss) else None,
-                            center_scale=args.center_scale,
+                            target_transform=target_transform,
                         )
                         teacher_view2 = teacher(
                             **view2,
                             use_dropout=False,
                             target=True,
-                            center=objective.center if isinstance(objective, BYOLLoss) else None,
-                            center_scale=args.center_scale,
+                            target_transform=target_transform,
                         )
 
                 if isinstance(objective, BYOLLoss):

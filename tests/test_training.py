@@ -336,6 +336,10 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
             config_name="config",
             overrides=["data.train_file=train.txt", "objective.center_scale=0.25"],
         )
+        dropout_only_config = compose(
+            config_name="config",
+            overrides=["data.train_file=train.txt", "augmentation=dropout"],
+        )
         alternate_config = compose(
             config_name="config",
             overrides=[
@@ -354,10 +358,12 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
 
     default_args = to_train_args(default_config)
     scaled_center_args = to_train_args(scaled_center_config)
+    dropout_only_args = to_train_args(dropout_only_config)
     alternate_args = to_train_args(alternate_config)
 
     assert default_args.objective == "byol"
-    assert default_args.augmentation == "dropout"
+    assert default_args.augmentation == ["word", "dropout"]
+    assert dropout_only_args.augmentation == ["dropout"]
     assert default_args.quiet is True
     assert default_args.tensorboard is True
     assert default_args.byol_precision == "bf16"
@@ -367,21 +373,21 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     assert default_args.projector_hidden_dim == 4096
     assert default_args.predictor_hidden_dim == 4096
     assert default_args.target_dropout == 0.02
-    assert default_args.center_momentum == 0.99
-    assert default_args.center_scale == 0.5
+    assert default_args.center_momentum == 0.96
+    assert default_args.center_scale == 0.05
     assert scaled_center_args.center_scale == 0.25
-    assert default_args.teacher_momentum == 0.999
-    assert default_args.batch_size == 32
-    assert default_args.encoder_learning_rate == 1e-5
-    assert default_args.head_learning_rate == 1e-4
-    assert default_args.encoder_freeze_steps == 200
+    assert default_args.teacher_momentum == 0.992
+    assert default_args.batch_size == 64
+    assert default_args.encoder_learning_rate == 3.05e-6
+    assert default_args.head_learning_rate == 2.97e-4
+    assert default_args.encoder_freeze_steps == 150
     assert default_args.max_length == 256
-    assert default_args.num_workers == 0
-    assert default_args.max_steps == 10000
-    assert default_args.eval_steps == 100
+    assert default_args.num_workers == 2
+    assert default_args.max_steps == 3000
+    assert default_args.eval_steps == 300
     assert alternate_args.objective == "infonce"
     assert alternate_args.infonce_temp == 0.2
-    assert alternate_args.augmentation == "word"
+    assert alternate_args.augmentation == ["word"]
     assert alternate_args.random_init is True
     assert alternate_args.pooling == "cls"
     assert alternate_args.projection_dim == 64

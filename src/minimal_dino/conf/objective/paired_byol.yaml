@@ -1,0 +1,13 @@
+# PRE-BYOL: scalar baseline plus causal paired reliability equalization.
+name: byol
+center_momentum: 0.96
+center_scale: 0.05
+target_geometry:
+  momentum: 0.96
+  strength: 1.0
+  ridge: 0.01
+  min_gain: 0.5
+  max_gain: 2.0
+  warmup_steps: 50
+  update_interval: 10
+  reliability: paired

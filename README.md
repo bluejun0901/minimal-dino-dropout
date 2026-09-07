@@ -5,7 +5,7 @@ augmentation:
 
 ```text
 bert-base-uncased -> configurable [CLS] or attention-mask-aware mean pooling
-    -> two independent dropout or word-augmented views
+    -> two independent dropout and/or word-augmented views
     -> BYOL: online projector + predictor / EMA target projector -> cosine regression
     -> InfoNCE: online view 1 / online view 2 -> symmetric in-batch contrastive loss
 ```
@@ -45,22 +45,31 @@ minibatches valid. Configure them with `model.projection_dim`, `model.projector_
 `model.predictor_hidden_dim`. The target network consumes only projector outputs. Its momentum is
 cosine-scheduled from `teacher.momentum` to 1.
 
-The encoder is frozen for the first `optimization.encoder_freeze_steps=200` optimizer steps while
+The encoder is frozen for the first `optimization.encoder_freeze_steps=150` optimizer steps while
 the randomly initialized projector and predictor adapt. Afterward it is unfrozen automatically.
-The encoder and head use separate learning rates (`1e-5` and `1e-4` by default), including their
+The encoder and head use separate learning rates (`3.05e-6` and `2.97e-4` by default), including their
 independent warmup and linear decay through the shared scheduler.
 
 The raw target embedding is centered before it enters the projector. The center is an EMA of
 previous target-embedding batch means and is updated only after computing each batch loss. Configure
-its decay with `objective.center_momentum` (default `0.99`) and the multiplier applied before subtraction with
-`objective.center_scale` (default `0.5`); the center is stored in checkpoints and its norm is logged
+its decay with `objective.center_momentum` (default `0.96`) and the multiplier applied before subtraction with
+`objective.center_scale` (default `0.05`); the center is stored in checkpoints and its norm is logged
 as `center_norm`.
 
-The default dropout augmentation feeds identical tokens through independent masks. Online views
-use `model.dropout=0.1`; target views use independent, less noisy masks controlled by
-`teacher.dropout=0.02`. The target rate must be positive and lower than the online rate. Select
-`augmentation=word` for word-level views, or `objective=infonce` to retain the contrastive
-baseline. On CUDA, BYOL uses BF16 by default; set `runtime.byol_precision=fp32` to disable it.
+The default `augmentation.names=[word,dropout]` applies both word augmentation and independent
+dropout masks. Online views use `model.dropout`; target views use independent, less noisy masks
+controlled by `teacher.dropout`. The target rate must be positive and lower than the online rate.
+Set `augmentation.names=[word]` or `augmentation.names=[dropout]` to enable only one augmentation
+(quote list overrides in the shell). The `augmentation=word` and `augmentation=dropout` config
+groups are equivalent shortcuts. Select `objective=infonce` to retain the contrastive baseline.
+On CUDA, BYOL uses BF16 by default; set `runtime.byol_precision=fp32` to disable it.
+
+An experimental, opt-in `objective=paired_byol` adds paired reliability equalization before the
+target projector. The default remains scalar-centered BYOL. This research method is **not yet
+validated as an improvement**. See [the research report](docs/pre_byol_research.md) for its hypothesis,
+equations, controlled comparisons, negative results, limitations, and reproduction commands.
+Use `objective.target_geometry.reliability=none`, `diagonal`, or `shuffled` for mechanism ablations;
+`objective.target_geometry.strength=0` recovers the scalar baseline exactly.
 
 Hydra writes its resolved config under the run directory. Full checkpoints contain the online and
 target networks, objective, optimizer, scheduler, RNG state, architecture config, and tokenizer.

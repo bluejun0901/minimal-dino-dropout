@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from minimal_dino.geometry import GeometryConfig, PairedTargetGeometry
+
 
 class BYOLLoss(nn.Module):
     """Symmetric BYOL regression with an EMA center for target embeddings."""
@@ -11,7 +13,13 @@ class BYOLLoss(nn.Module):
     representation = "prediction"
     uses_teacher = True
 
-    def __init__(self, embedding_dim: int, center_momentum: float = 0.9) -> None:
+    def __init__(
+        self,
+        embedding_dim: int,
+        center_momentum: float = 0.9,
+        *,
+        target_geometry: dict | None = None,
+    ) -> None:
         super().__init__()
         if isinstance(embedding_dim, bool) or not isinstance(embedding_dim, int):
             raise ValueError("embedding_dim must be an integer")
@@ -21,6 +29,17 @@ class BYOLLoss(nn.Module):
             raise ValueError("center_momentum must be in [0, 1)")
         self.center_momentum = center_momentum
         self.register_buffer("center", torch.zeros(1, embedding_dim))
+        self.geometry = (
+            PairedTargetGeometry(embedding_dim, GeometryConfig(**target_geometry))
+            if target_geometry is not None
+            else None
+        )
+
+    def transform_target(self, embedding: torch.Tensor, center_scale: float) -> torch.Tensor:
+        centered = embedding.float() - self.center * center_scale
+        if self.geometry is None or self.geometry.config.strength == 0:
+            return centered
+        return centered + self.geometry(embedding)
 
     def forward(
         self,
@@ -49,6 +68,7 @@ class BYOLLoss(nn.Module):
             .std(dim=0, unbiased=False)
             .mean(),
             "center_norm": self.center.norm(),
+            **(self.geometry.metrics() if self.geometry is not None else {}),
         }
 
     @torch.no_grad()
@@ -58,6 +78,8 @@ class BYOLLoss(nn.Module):
         self.center.mul_(self.center_momentum).add_(
             batch_center, alpha=1.0 - self.center_momentum
         )
+        if self.geometry is not None:
+            self.geometry.update(teacher_embeddings)
 
 
 class InfoNCELoss(nn.Module):
@@ -107,12 +129,14 @@ def build_objective(
     embedding_dim: int | None = None,
     center_momentum: float,
     infonce_temp: float,
+    target_geometry: dict | None = None,
 ) -> BYOLLoss | InfoNCELoss:
     """Construct an objective while keeping objective-specific settings local."""
     if name == "byol":
         return BYOLLoss(
             projection_dim if embedding_dim is None else embedding_dim,
             center_momentum,
+            target_geometry=target_geometry,
         )
     if name == "infonce":
         return InfoNCELoss(infonce_temp)
