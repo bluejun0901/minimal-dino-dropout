@@ -2,7 +2,7 @@ name: bert-base-uncased
 revision: 86b5e0934494bd15c9632b12f734a8a67f723594
 random_init: false
 dropout: 0.35
-pooling: mean
+pooling: cls
 projection_dim: 256
 projector_hidden_dim: 4096
 predictor_hidden_dim: 4096

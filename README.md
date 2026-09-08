@@ -56,11 +56,14 @@ its decay with `objective.center_momentum` (default `0.99`) and the multiplier a
 `objective.center_scale` (default `0.5`); the center is stored in checkpoints and its norm is logged
 as `center_norm`.
 
-The default dropout augmentation feeds identical tokens through independent masks. Online views
-use `model.dropout=0.1`; target views use independent, less noisy masks controlled by
-`teacher.dropout=0.02`. The target rate must be positive and lower than the online rate. Select
-`augmentation=word` for word-level views, or `objective=infonce` to retain the contrastive
-baseline. On CUDA, BYOL uses BF16 by default; set `runtime.byol_precision=fp32` to disable it.
+The default `augmentation=word_dropout` combines two independently word-augmented views with
+independent encoder dropout masks. Online views use `model.dropout`; target views use independent,
+less noisy masks controlled by `teacher.dropout=0.02`. The target rate must be positive and lower
+than the online rate. Select `augmentation=word` for word-level views with dropout disabled, or
+`augmentation=dropout` for identical input tokens with independent dropout masks. You can also set
+`'augmentation.names=[word,dropout]'` explicitly; list order does not affect the behavior. Both
+BYOL and `objective=infonce` support these combinations. On CUDA, BYOL uses BF16 by default;
+set `runtime.byol_precision=fp32` to disable it.
 
 Hydra writes its resolved config under the run directory. Full checkpoints contain the online and
 target networks, objective, optimizer, scheduler, RNG state, architecture config, and tokenizer.

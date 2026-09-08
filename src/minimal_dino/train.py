@@ -366,6 +366,8 @@ def train(
 
     if not 0.0 <= args.augmentation_strength <= 1.0:
         raise ValueError("augmentation_strength must be in [0, 1]")
+    use_word_augmentation = "word" in args.augmentation
+    use_dropout = "dropout" in args.augmentation
     device = torch.device(args.device)
     args.model_revision = resolve_model_revision(args.model_name, args.model_revision)
     save_run_artifacts(args.output_dir, run_config if run_config is not None else args)
@@ -411,7 +413,7 @@ def train(
     generator = torch.Generator().manual_seed(args.seed)
     collator = (
         TokenizeCollator(tokenizer, args.max_length)
-        if args.augmentation == "dropout"
+        if not use_word_augmentation
         else WordViewCollator(tokenizer, args.max_length, args.augmentation_strength)
     )
     loader = DataLoader(
@@ -425,7 +427,7 @@ def train(
         pin_memory=optimize_byol_cuda,
         persistent_workers=(
             isinstance(objective, BYOLLoss)
-            and args.augmentation == "dropout"
+            and not use_word_augmentation
             and args.num_workers > 0
         ),
     )
@@ -521,7 +523,7 @@ def train(
     start_epoch = global_step // steps_per_epoch
     resume_batch = global_step % steps_per_epoch
     for epoch in range(start_epoch, args.epochs):
-        if args.augmentation == "word":
+        if use_word_augmentation:
             # Replaying skipped batches after resume reproduces the same augmented views.
             random.seed(args.seed + epoch)
         generator.manual_seed(args.seed + epoch)
@@ -537,7 +539,7 @@ def train(
                 dtype=torch.bfloat16,
                 enabled=use_byol_bf16,
             ):
-                if args.augmentation == "dropout":
+                if not use_word_augmentation:
                     batch = {
                         name: value.to(device, non_blocking=optimize_byol_cuda)
                         for name, value in batch.items()
@@ -601,19 +603,21 @@ def train(
                         }
                         for view in batch
                     )
-                    student_view1 = student(**view1, use_dropout=False)
-                    student_view2 = student(**view2, use_dropout=False)
+                    student_view1 = student(**view1, use_dropout=use_dropout)
+                    student_view2 = student(**view2, use_dropout=use_dropout)
                     with torch.no_grad():
                         teacher_view1 = teacher(
                             **view1,
-                            use_dropout=False,
+                            use_dropout=use_dropout,
+                            dropout_probability=args.target_dropout,
                             target=True,
                             center=objective.center if isinstance(objective, BYOLLoss) else None,
                             center_scale=args.center_scale,
                         )
                         teacher_view2 = teacher(
                             **view2,
-                            use_dropout=False,
+                            use_dropout=use_dropout,
+                            dropout_probability=args.target_dropout,
                             target=True,
                             center=objective.center if isinstance(objective, BYOLLoss) else None,
                             center_scale=args.center_scale,
@@ -657,7 +661,7 @@ def train(
                 )
             optimizer.zero_grad(set_to_none=True)
 
-            if args.augmentation == "dropout" and not dropout_views_checked:
+            if use_dropout and not use_word_augmentation and not dropout_views_checked:
                 if torch.equal(student_view1.embedding, student_view2.embedding):
                     warnings.warn(
                         "Dropout views are identical; check that encoder dropout is nonzero."

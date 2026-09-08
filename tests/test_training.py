@@ -44,6 +44,92 @@ class TinyEncoder(nn.Module):
         return SimpleNamespace(last_hidden_state=hidden)
 
 
+@pytest.mark.parametrize("objective", ["byol", "infonce"])
+@pytest.mark.parametrize(
+    "augmentations", [["dropout"], ["word"], ["word", "dropout"], ["dropout", "word"]]
+)
+def test_training_applies_selected_augmentations(tmp_path, monkeypatch, objective, augmentations):
+    from minimal_dino.config import to_train_args
+    from minimal_dino.train import train
+
+    train_file = tmp_path / "sentences.txt"
+    train_file.write_text("one two three\nfour five six\nseven eight nine\n")
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        config = compose(
+            config_name="config",
+            overrides=[
+                f"objective={objective}",
+                "augmentation.names=[" + ",".join(augmentations) + "]",
+                f"data.train_file={train_file}",
+                "data.num_workers=0",
+                "runtime.device=cpu",
+                f"runtime.output_dir={tmp_path / 'run'}",
+                "optimization.max_steps=1",
+                "optimization.encoder_freeze_steps=0",
+                "evaluation.steps=0",
+                "checkpoint.save_steps=0",
+                "logging.tensorboard=false",
+                "model.projection_dim=4",
+                "model.projector_hidden_dim=16",
+                "model.predictor_hidden_dim=12",
+            ],
+        )
+    args = to_train_args(config)
+    forwards = []
+    augmented_sentences = []
+
+    class RecordingEncoder(TinyEncoder):
+        def forward(self, input_ids, attention_mask, return_dict=True):
+            forwards.append((input_ids.clone(), self.dropout.training, self.dropout.p))
+            return super().forward(input_ids, attention_mask, return_dict)
+
+    class Tokenizer:
+        def __call__(self, sentences, **kwargs):
+            lengths = [len(sentence.split()) for sentence in sentences]
+            mask = torch.arange(max(lengths))[None, :] < torch.tensor(lengths)[:, None]
+            return {"input_ids": mask.long(), "attention_mask": mask.long()}
+
+    def build_model(*unused, **kwargs):
+        encoder = RecordingEncoder()
+        encoder.dropout.p = kwargs["dropout"]
+        return SentenceBYOL(
+            encoder, projection_dim=4, projector_hidden_dim=16, predictor_hidden_dim=12
+        )
+
+    def augment(text, strength):
+        # Different lengths also verify that combined views may have different padding.
+        augmented_sentences.append(text)
+        return text + " extra" * len(augmented_sentences)
+
+    monkeypatch.setattr(
+        "minimal_dino.train.AutoTokenizer.from_pretrained", lambda *a, **k: Tokenizer()
+    )
+    monkeypatch.setattr(SentenceBYOL, "from_pretrained", build_model)
+    monkeypatch.setattr("minimal_dino.data.augment_words", augment)
+    monkeypatch.setattr("minimal_dino.train.save_run_artifacts", lambda *a, **k: None)
+
+    train(args, save_final_checkpoint=False)
+
+    has_word = "word" in augmentations
+    has_dropout = "dropout" in augmentations
+    student_forwards, teacher_forwards = forwards[:-2], forwards[-2:]
+    assert len(augmented_sentences) == (6 if has_word else 0)
+    assert all(enabled == has_dropout for _, enabled, _ in forwards)
+    assert all(rate == args.dropout for _, _, rate in student_forwards)
+    if has_dropout:
+        assert all(rate == args.target_dropout for _, _, rate in teacher_forwards)
+    if has_word:
+        assert len(student_forwards) == 2
+        assert student_forwards[0][0].shape[1] != student_forwards[1][0].shape[1]
+        for student_forward, teacher_forward in zip(student_forwards, teacher_forwards):
+            assert torch.equal(student_forward[0], teacher_forward[0])
+    else:
+        assert all(ids.shape[1] == 3 for ids, _, _ in forwards)
+    metrics = json.loads((tmp_path / "run" / "metrics.jsonl").read_text())
+    assert metrics["step"] == 1
+    assert torch.isfinite(torch.tensor(metrics["loss"]))
+
+
 def test_one_step_smoke_has_student_gradients_no_teacher_gradients_and_ema():
     torch.manual_seed(2)
     student = SentenceBYOL(
@@ -357,34 +443,34 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     alternate_args = to_train_args(alternate_config)
 
     assert default_args.objective == "byol"
-    assert default_args.augmentation == "dropout"
+    assert default_args.augmentation == ["word", "dropout"]
     assert default_args.quiet is True
     assert default_args.tensorboard is True
     assert default_args.byol_precision == "bf16"
     assert default_args.random_init is False
-    assert default_args.pooling == "mean"
+    assert default_args.pooling == default_config.model.pooling
     assert default_args.projection_dim == 256
     assert default_args.projector_hidden_dim == 4096
     assert default_args.predictor_hidden_dim == 4096
     assert default_args.target_dropout == 0.02
-    assert default_args.center_momentum == 0.99
-    assert default_args.center_scale == 0.5
+    assert default_args.center_momentum == default_config.objective.center_momentum
+    assert default_args.center_scale == default_config.objective.center_scale
     assert scaled_center_args.center_scale == 0.25
-    assert default_args.teacher_momentum == 0.999
-    assert default_args.batch_size == 32
-    assert default_args.encoder_learning_rate == 1e-5
-    assert default_args.head_learning_rate == 1e-4
-    assert default_args.encoder_freeze_steps == 200
+    assert default_args.teacher_momentum == default_config.teacher.momentum
+    assert default_args.batch_size == default_config.optimization.batch_size
+    assert default_args.encoder_learning_rate == default_config.optimization.encoder_learning_rate
+    assert default_args.head_learning_rate == default_config.optimization.head_learning_rate
+    assert default_args.encoder_freeze_steps == default_config.optimization.encoder_freeze_steps
     assert default_args.max_length == 256
-    assert default_args.num_workers == 0
-    assert default_args.max_steps == 10000
-    assert default_args.eval_steps == 100
+    assert default_args.num_workers == default_config.data.num_workers
+    assert default_args.max_steps == default_config.optimization.max_steps
+    assert default_args.eval_steps == default_config.evaluation.steps
     assert alternate_args.objective == "infonce"
     assert alternate_args.infonce_temp == 0.2
-    assert alternate_args.augmentation == "word"
+    assert alternate_args.augmentation == ["word"]
     assert alternate_args.random_init is True
     assert alternate_args.pooling == "cls"
     assert alternate_args.projection_dim == 64
-    assert alternate_args.center_scale == 0.5
+    assert alternate_args.center_scale == 0.5  # InfoNCE has no center setting.
     assert alternate_args.quiet is True
     assert alternate_args.tensorboard is False
