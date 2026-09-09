@@ -7,6 +7,8 @@ from typing import Any
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from minimal_dino.lora import lora_config
+
 
 def to_train_args(config: DictConfig) -> SimpleNamespace:
     """Translate the grouped Hydra config at the training-loop boundary."""
@@ -64,6 +66,11 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
     if not 0.0 < target_dropout < model["dropout"]:
         raise ValueError("teacher.dropout must be positive and lower than model.dropout")
     center_momentum = objective.get("center_momentum", 0.9)
+    initial_bert_correction = objective.get("initial_bert_correction", False)
+    if not isinstance(initial_bert_correction, bool):
+        raise ValueError("objective.initial_bert_correction must be a boolean")
+    if initial_bert_correction and objective["name"] != "byol":
+        raise ValueError("objective.initial_bert_correction requires BYOL")
     if (
         isinstance(center_momentum, bool)
         or not isinstance(center_momentum, (int, float))
@@ -106,6 +113,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         random_init=model["random_init"],
         dropout=model["dropout"],
         pooling=model["pooling"],
+        lora=lora_config(model.get("lora")),
         projection_dim=model["projection_dim"],
         projector_hidden_dim=model["projector_hidden_dim"],
         predictor_hidden_dim=model["predictor_hidden_dim"],
@@ -113,6 +121,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         augmentation_strength=augmentation["strength"],
         objective=objective["name"],
         center_momentum=center_momentum,
+        initial_bert_correction=initial_bert_correction,
         center_scale=center_scale,
         center_scale_start=center_scale_start,
         center_scale_end=center_scale_end,

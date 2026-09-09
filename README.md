@@ -50,6 +50,30 @@ the randomly initialized projector and predictor adapt. Afterward it is unfrozen
 The encoder and head use separate learning rates (`1e-5` and `1e-4` by default), including their
 independent warmup and linear decay through the shared scheduler.
 
+### Optional BERT LoRA
+
+LoRA is disabled by default. Enable it to freeze the original BERT weights and train
+low-rank adapters in each attention query/value layer, together with the BYOL head:
+
+```bash
+source .venv/bin/activate
+uv run python -m minimal_dino.train \
+  model.lora.enabled=true \
+  model.lora.r=8 \
+  model.lora.alpha=16 \
+  'model.lora.target_modules=[query,value]'
+```
+
+Targets match BERT linear-layer names or dotted path suffixes. Each update is scaled by
+`alpha / r` and initially zero. No additional dependency is required. The adapters use
+`optimization.encoder_learning_rate` and remain frozen during `optimization.encoder_freeze_steps`;
+the original BERT weights stay frozen afterward. For immediate adapter training, set
+`optimization.encoder_freeze_steps=0`. LoRA also works with `objective=infonce` and
+`model.random_init=true`. Teacher adapters follow the existing EMA updates.
+
+Full checkpoints include the adapter weights and configuration; evaluation reconstructs them
+automatically. When resuming training, use the same `model.lora.*` settings as the saved run.
+
 The raw target embedding is centered before it enters the projector. The center is an EMA of
 previous target-embedding batch means and is updated only after computing each batch loss. Configure
 its decay with `objective.center_momentum` and the multiplier applied before subtraction with
@@ -146,3 +170,14 @@ uv run pytest -q
 
 Primary references: [BYOL](https://arxiv.org/abs/2006.07733),
 [DINO](https://arxiv.org/abs/2104.14294), and [SimCSE](https://arxiv.org/abs/2104.08821).
+
+Enable the optional initial-encoder cross-view correction with
+`objective.initial_bert_correction=true` (BYOL only; disabled by default).
+The target for view 1 becomes
+`project_teacher(teacher(x1) - alpha * center - initial_bert(x1) + initial_bert(x2))`;
+view 2 uses the opposite difference. `initial_bert` is a frozen copy of the
+encoder at training initialization, with the same pooling and dropout disabled
+(including when `model.random_init=true`). Dropout-only augmentation has identical
+token inputs, so its correction is zero. Word augmentation can produce a nonzero
+correction. The frozen reference is saved in checkpoints and restored on resume;
+enabling correction when resuming a checkpoint without this reference is rejected.

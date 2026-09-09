@@ -45,13 +45,15 @@ class TinyEncoder(nn.Module):
         return SimpleNamespace(last_hidden_state=hidden)
 
 
-@pytest.mark.parametrize("objective", ["byol", "infonce"])
+@pytest.mark.parametrize(
+    "objective,correction", [("byol", False), ("infonce", False), ("byol", True)]
+)
 @pytest.mark.parametrize("resume_step", [0, 1])
 @pytest.mark.parametrize(
     "augmentations", [["dropout"], ["word"], ["word", "dropout"], ["dropout", "word"]]
 )
 def test_training_applies_selected_augmentations(
-    tmp_path, monkeypatch, objective, augmentations, resume_step
+    tmp_path, monkeypatch, objective, correction, augmentations, resume_step
 ):
     from minimal_dino.config import to_train_args
     from minimal_dino.train import train
@@ -81,11 +83,12 @@ def test_training_applies_selected_augmentations(
             ],
         )
     args = to_train_args(config)
+    args.initial_bert_correction = correction
     args.center_scale_start = 0.1
     args.center_scale_end = 0.5
     if resume_step:
         args.resume_from_checkpoint = "mock-checkpoint.pt"
-        monkeypatch.setattr("minimal_dino.train.restore_checkpoint", lambda *a: resume_step)
+        monkeypatch.setattr("minimal_dino.train.restore_checkpoint", lambda *a, **k: resume_step)
     forwards = []
     augmented_sentences = []
     target_scales = []
@@ -127,6 +130,11 @@ def test_training_applies_selected_augmentations(
     monkeypatch.setattr("minimal_dino.train.save_run_artifacts", lambda *a, **k: None)
 
     train(args, save_final_checkpoint=False)
+
+    if correction and "word" in augmentations:
+        # Each step adds two deterministic frozen-reference forwards after the targets.
+        assert all(not enabled for i, (_, enabled, _) in enumerate(forwards) if i % 6 >= 4)
+        forwards = [record for i, record in enumerate(forwards) if i % 6 < 4]
 
     has_word = "word" in augmentations
     has_dropout = "dropout" in augmentations
@@ -269,8 +277,9 @@ class TinyTokenizer:
 
 
 @pytest.mark.parametrize("pooling", ["mean", "cls"])
+@pytest.mark.parametrize("correction", [False, True])
 def test_checkpoint_round_trip_restores_models_optimizer_objective_and_rng(
-    tmp_path, pooling
+    tmp_path, pooling, correction
 ):
     torch.manual_seed(7)
     student = SentenceBYOL(
@@ -285,6 +294,7 @@ def test_checkpoint_round_trip_restores_models_optimizer_objective_and_rng(
     optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     original_student = copy.deepcopy(student.state_dict())
+    initial = copy.deepcopy(teacher) if correction else None
     checkpoint = save_checkpoint(
         tmp_path,
         student,
@@ -296,18 +306,27 @@ def test_checkpoint_round_trip_restores_models_optimizer_objective_and_rng(
         SimpleNamespace(seed=7, objective="byol"),
         step=3,
         checkpoint_name="checkpoint-step-3.pt",
+        initial_bert=initial,
     )
     expected_random = torch.rand(4)
 
     with torch.no_grad():
         next(student.parameters()).add_(10)
         objective.center.fill_(10)
+        if initial is not None:
+            next(initial.parameters()).add_(20)
     step = restore_checkpoint(
-        checkpoint, student, teacher, objective, optimizer, scheduler, torch.device("cpu")
+        checkpoint, student, teacher, objective, optimizer, scheduler, torch.device("cpu"),
+        initial_bert=initial,
     )
     actual_random = torch.rand(4)
 
     assert step == 3
+    if initial is not None:
+        assert all(
+            torch.equal(value, original_student[name])
+            for name, value in initial.state_dict().items()
+        )
     assert all(
         torch.equal(value, original_student[name]) for name, value in student.state_dict().items()
     )
@@ -550,3 +569,33 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     assert alternate_args.center_scale == 0.5  # InfoNCE has no center setting.
     assert alternate_args.quiet is True
     assert alternate_args.tensorboard is False
+
+
+def test_initial_bert_correction_cross_view_sign_and_frozen_target():
+    from minimal_dino.train import correct_teacher_views
+
+    teacher = SentenceBYOL(
+        TinyEncoder(), projection_dim=4, projector_hidden_dim=16, predictor_hidden_dim=12
+    ).eval().requires_grad_(False)
+    initial = copy.deepcopy(teacher)
+    views = tuple(
+        {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids))}
+        for ids in ([1, 2, 3], [4, 5])
+    )
+    center = torch.randn(1, 8)
+    targets = tuple(teacher(**view, use_dropout=False, target=True) for view in views)
+    original_embeddings = tuple(target.embedding.clone() for target in targets)
+    delta = initial.encode(**views[1]) - initial.encode(**views[0])
+    captured = []
+    handle = teacher.head.projector.register_forward_pre_hook(
+        lambda module, args: captured.append(args[0].clone())
+    )
+    correct_teacher_views(teacher, initial, views, targets, center, 0.25)
+    handle.remove()
+    for index, sign in enumerate((1, -1)):
+        torch.testing.assert_close(
+            captured[index], original_embeddings[index] - 0.25 * center + sign * delta
+        )
+        torch.testing.assert_close(targets[index].embedding, original_embeddings[index])
+        assert not targets[index].projection.requires_grad
+    assert all(parameter.grad is None for parameter in initial.parameters())

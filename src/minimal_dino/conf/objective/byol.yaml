@@ -1,4 +1,5 @@
 name: byol
+initial_bert_correction: false
 center_momentum: 0.96
 center_scale: 0.05
 # Null start falls back to center_scale; null end keeps the start value constant.

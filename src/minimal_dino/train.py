@@ -224,7 +224,9 @@ def cosine_center_scale(step: int, total_steps: int, start: float, end: float) -
 
 def set_encoder_trainable(model: SentenceBYOL, trainable: bool) -> None:
     """Freeze or unfreeze only the online encoder, leaving the BYOL head trainable."""
-    model.encoder.requires_grad_(trainable)
+    for name, parameter in model.encoder.named_parameters():
+        is_adapter = name.endswith((".lora_A", ".lora_B"))
+        parameter.requires_grad_(trainable and (not model.lora["enabled"] or is_adapter))
 
 
 @torch.no_grad()
@@ -269,6 +271,24 @@ def off_diagonal_cosine(embeddings: torch.Tensor) -> torch.Tensor:
     return similarities[indices[0], indices[1]].mean()
 
 
+@torch.no_grad()
+def correct_teacher_views(
+    teacher: SentenceBYOL,
+    initial_bert: SentenceBYOL,
+    views: tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]],
+    targets: tuple[BYOLOutput, BYOLOutput],
+    center: torch.Tensor,
+    center_scale: float,
+) -> None:
+    """Move each centered target by the frozen initial encoder's cross-view difference."""
+    initial1, initial2 = (initial_bert.encode(**view).float() for view in views)
+    difference = initial2 - initial1
+    for target, correction in zip(targets, (difference, -difference)):
+        target.projection = teacher.head.project(
+            target.embedding.float() - center_scale * center + correction
+        )
+
+
 def save_checkpoint(
     output_dir: Path,
     student: SentenceBYOL,
@@ -280,6 +300,7 @@ def save_checkpoint(
     args: SimpleNamespace,
     step: int,
     checkpoint_name: str = "checkpoint.pt",
+    initial_bert: SentenceBYOL | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(output_dir / "tokenizer")
@@ -290,6 +311,7 @@ def save_checkpoint(
         {
             "student": student.state_dict(),
             "teacher": teacher.state_dict(),
+            "initial_bert": initial_bert.state_dict() if initial_bert is not None else None,
             "objective_name": args.objective,
             "objective": objective.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -322,8 +344,13 @@ def restore_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     device: torch.device,
+    initial_bert: SentenceBYOL | None = None,
 ) -> int:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if initial_bert is not None:
+        if checkpoint.get("initial_bert") is None:
+            raise ValueError("Checkpoint has no initial BERT for the requested correction")
+        initial_bert.load_state_dict(checkpoint["initial_bert"])
     checkpoint_objective = checkpoint["objective_name"]
     if checkpoint_objective != objective_name(objective):
         raise ValueError(
@@ -333,7 +360,7 @@ def restore_checkpoint(
     checkpoint_head_config = checkpoint_model_config(checkpoint)
     expected_head_config = model_config(student)
     if checkpoint_head_config != expected_head_config:
-        raise ValueError("Checkpoint projection-head configuration does not match this run")
+        raise ValueError("Checkpoint model configuration does not match this run")
     student.load_state_dict(checkpoint["student"])
     teacher.load_state_dict(checkpoint["teacher"])
     objective.load_state_dict(checkpoint["objective"])
@@ -392,9 +419,15 @@ def train(
         projection_dim=args.projection_dim,
         projector_hidden_dim=args.projector_hidden_dim,
         predictor_hidden_dim=args.predictor_hidden_dim,
+        lora=getattr(args, "lora", None),
     ).to(device)
     teacher = copy.deepcopy(student).to(device).eval()
     teacher.requires_grad_(False)
+    initial_bert = None
+    if getattr(args, "initial_bert_correction", False):
+        if args.objective != "byol":
+            raise ValueError("initial_bert_correction requires BYOL")
+        initial_bert = copy.deepcopy(teacher).eval().requires_grad_(False)
     objective = build_objective(
         args.objective,
         projection_dim=args.projection_dim,
@@ -498,7 +531,8 @@ def train(
     global_step = 0
     if args.resume_from_checkpoint:
         global_step = restore_checkpoint(
-            args.resume_from_checkpoint, student, teacher, objective, optimizer, scheduler, device
+            args.resume_from_checkpoint, student, teacher, objective, optimizer, scheduler, device,
+            initial_bert=initial_bert,
         )
         if global_step >= total_steps:
             raise ValueError("Checkpoint has already reached the requested total training steps")
@@ -636,6 +670,12 @@ def train(
                         )
 
                 if isinstance(objective, BYOLLoss):
+                    # Identical token inputs (dropout-only augmentation) have zero correction.
+                    if initial_bert is not None and use_word_augmentation:
+                        correct_teacher_views(
+                            teacher, initial_bert, (view1, view2),
+                            (teacher_view1, teacher_view2), objective.center, center_scale,
+                        )
                     if student_view1.prediction is None or student_view2.prediction is None:
                         raise RuntimeError("Online BYOL views must contain predictions")
                     loss, loss_metrics = objective(
@@ -776,6 +816,7 @@ def train(
                     args,
                     global_step,
                     checkpoint_name=f"checkpoint-step-{global_step}.pt",
+                    initial_bert=initial_bert,
                 )
                 remove_old_periodic_checkpoints(Path(args.output_dir), args.keep_last_checkpoints)
                 if not args.quiet:
@@ -799,6 +840,7 @@ def train(
             tokenizer,
             args,
             global_step,
+            initial_bert=initial_bert,
         )
     if tensorboard_writer is not None:
         tensorboard_writer.close()

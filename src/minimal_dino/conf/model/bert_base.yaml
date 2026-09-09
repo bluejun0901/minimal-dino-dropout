@@ -3,6 +3,11 @@ revision: 86b5e0934494bd15c9632b12f734a8a67f723594
 random_init: false
 dropout: 0.35
 pooling: mean
-projection_dim: 1024
+projection_dim: 256
 projector_hidden_dim: 4096
 predictor_hidden_dim: 4096
+lora:
+  enabled: false
+  r: 8
+  alpha: 16.0
+  target_modules: [query, value]

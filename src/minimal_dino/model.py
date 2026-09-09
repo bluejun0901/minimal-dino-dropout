@@ -9,6 +9,8 @@ from torch import nn
 from transformers import AutoConfig, AutoModel
 from transformers.utils import logging as transformers_logging
 
+from minimal_dino.lora import apply_lora, lora_config
+
 transformers_logging.set_verbosity_error()
 
 
@@ -109,11 +111,15 @@ class SentenceBYOL(nn.Module):
         projector_hidden_dim: int = 4_096,
         predictor_hidden_dim: int = 4_096,
         pooling: str = "mean",
+        lora: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if pooling not in {"cls", "mean"}:
             raise ValueError("pooling must be 'cls' or 'mean'")
         self.encoder = encoder
+        self.lora = lora_config(lora)
+        if self.lora["enabled"]:
+            apply_lora(self.encoder, self.lora)
         self.pooling = pooling
         self.head = BYOLHead(
             encoder.config.hidden_size,
@@ -210,6 +216,7 @@ def model_config(model: SentenceBYOL) -> dict[str, Any]:
         "projector_hidden_dim": model.head.projector_hidden_dim,
         "predictor_hidden_dim": model.head.predictor_hidden_dim,
         "pooling": model.pooling,
+        **({"lora": lora_config(model.lora)} if model.lora["enabled"] else {}),
     }
 
 
