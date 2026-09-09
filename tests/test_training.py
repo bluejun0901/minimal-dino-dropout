@@ -13,6 +13,7 @@ from minimal_dino.objective import BYOLLoss
 from minimal_dino.train import (
     DEFAULT_MODEL_REVISION,
     _print_progress,
+    cosine_center_scale,
     cosine_teacher_momentum,
     load_max_logged_metric,
     log_metrics,
@@ -45,10 +46,13 @@ class TinyEncoder(nn.Module):
 
 
 @pytest.mark.parametrize("objective", ["byol", "infonce"])
+@pytest.mark.parametrize("resume_step", [0, 1])
 @pytest.mark.parametrize(
     "augmentations", [["dropout"], ["word"], ["word", "dropout"], ["dropout", "word"]]
 )
-def test_training_applies_selected_augmentations(tmp_path, monkeypatch, objective, augmentations):
+def test_training_applies_selected_augmentations(
+    tmp_path, monkeypatch, objective, augmentations, resume_step
+):
     from minimal_dino.config import to_train_args
     from minimal_dino.train import train
 
@@ -64,19 +68,33 @@ def test_training_applies_selected_augmentations(tmp_path, monkeypatch, objectiv
                 "data.num_workers=0",
                 "runtime.device=cpu",
                 f"runtime.output_dir={tmp_path / 'run'}",
-                "optimization.max_steps=1",
+                "++optimization.max_steps=3",
+                "optimization.epochs=3",
                 "optimization.encoder_freeze_steps=0",
                 "evaluation.steps=0",
                 "checkpoint.save_steps=0",
                 "logging.tensorboard=false",
+                "logging.steps=1",
                 "model.projection_dim=4",
                 "model.projector_hidden_dim=16",
                 "model.predictor_hidden_dim=12",
             ],
         )
     args = to_train_args(config)
+    args.center_scale_start = 0.1
+    args.center_scale_end = 0.5
+    if resume_step:
+        args.resume_from_checkpoint = "mock-checkpoint.pt"
+        monkeypatch.setattr("minimal_dino.train.restore_checkpoint", lambda *a: resume_step)
     forwards = []
     augmented_sentences = []
+    target_scales = []
+
+    class RecordingModel(SentenceBYOL):
+        def forward(self, *a, **kwargs):
+            if kwargs.get("center") is not None:
+                target_scales.append(kwargs["center_scale"])
+            return super().forward(*a, **kwargs)
 
     class RecordingEncoder(TinyEncoder):
         def forward(self, input_ids, attention_mask, return_dict=True):
@@ -92,7 +110,7 @@ def test_training_applies_selected_augmentations(tmp_path, monkeypatch, objectiv
     def build_model(*unused, **kwargs):
         encoder = RecordingEncoder()
         encoder.dropout.p = kwargs["dropout"]
-        return SentenceBYOL(
+        return RecordingModel(
             encoder, projection_dim=4, projector_hidden_dim=16, predictor_hidden_dim=12
         )
 
@@ -112,22 +130,37 @@ def test_training_applies_selected_augmentations(tmp_path, monkeypatch, objectiv
 
     has_word = "word" in augmentations
     has_dropout = "dropout" in augmentations
-    student_forwards, teacher_forwards = forwards[:-2], forwards[-2:]
-    assert len(augmented_sentences) == (6 if has_word else 0)
+    steps = 3 - resume_step
+    forwards_per_step = 3 if objective == "byol" and not has_word else 4
+    assert len(forwards) == forwards_per_step * steps
+    assert len(augmented_sentences) == (6 * steps if has_word else 0)
     assert all(enabled == has_dropout for _, enabled, _ in forwards)
-    assert all(rate == args.dropout for _, _, rate in student_forwards)
-    if has_dropout:
-        assert all(rate == args.target_dropout for _, _, rate in teacher_forwards)
-    if has_word:
-        assert len(student_forwards) == 2
-        assert student_forwards[0][0].shape[1] != student_forwards[1][0].shape[1]
-        for student_forward, teacher_forward in zip(student_forwards, teacher_forwards):
-            assert torch.equal(student_forward[0], teacher_forward[0])
+    for offset in range(0, len(forwards), forwards_per_step):
+        batch_forwards = forwards[offset : offset + forwards_per_step]
+        student_forwards, teacher_forwards = batch_forwards[:-2], batch_forwards[-2:]
+        assert all(rate == args.dropout for _, _, rate in student_forwards)
+        if has_dropout:
+            assert all(rate == args.target_dropout for _, _, rate in teacher_forwards)
+        if has_word:
+            assert len(student_forwards) == 2
+            assert student_forwards[0][0].shape[1] != student_forwards[1][0].shape[1]
+            for student_forward, teacher_forward in zip(student_forwards, teacher_forwards):
+                assert torch.equal(student_forward[0], teacher_forward[0])
+        else:
+            assert all(ids.shape[1] == 3 for ids, _, _ in batch_forwards)
+    metrics = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert [record["step"] for record in metrics] == list(range(resume_step + 1, 4))
+    assert all(torch.isfinite(torch.tensor(record["loss"])) for record in metrics)
+    if objective == "byol":
+        expected_scales = [0.1, 0.3, 0.5][resume_step:]
+        assert target_scales == pytest.approx([s for s in expected_scales for _ in range(2)])
+        assert [record["center_scale"] for record in metrics] == pytest.approx(expected_scales)
     else:
-        assert all(ids.shape[1] == 3 for ids, _, _ in forwards)
-    metrics = json.loads((tmp_path / "run" / "metrics.jsonl").read_text())
-    assert metrics["step"] == 1
-    assert torch.isfinite(torch.tensor(metrics["loss"]))
+        assert target_scales == []
+        assert all("center_scale" not in record for record in metrics)
 
 
 def test_one_step_smoke_has_student_gradients_no_teacher_gradients_and_ema():
@@ -171,6 +204,49 @@ def test_teacher_momentum_cosine_schedule_reaches_one():
     assert values[0] == 0.996
     assert values[-1] == 1.0
     assert values == sorted(values)
+
+
+@pytest.mark.parametrize(
+    "start,end,expected",
+    [(0.0, 1.0, [0.0, 0.1464466094, 0.5, 0.8535533906, 1.0]),
+     (1.0, 0.0, [1.0, 0.8535533906, 0.5, 0.1464466094, 0.0]),
+     (0.2, 0.2, [0.2, 0.2, 0.2, 0.2, 0.2])],
+)
+def test_cosine_center_scale(start, end, expected):
+    assert [cosine_center_scale(t, 5, start, end) for t in range(5)] == pytest.approx(expected)
+    assert cosine_center_scale(0, 1, start, end) == start
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        (["objective.center_scale=0.25"], (0.25, 0.25)),
+        (["objective.center_scale_start=0.1"], (0.1, 0.1)),
+        (["objective.center_scale=0.25", "objective.center_scale_end=0.5"], (0.25, 0.5)),
+        (["objective.center_scale_start=0.5", "objective.center_scale_end=0.0"], (0.5, 0.0)),
+    ],
+)
+def test_center_scale_schedule_config(overrides, expected):
+    from minimal_dino.config import to_train_args
+
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        args = to_train_args(compose(
+            config_name="config",
+            overrides=["objective.center_scale_start=null", "objective.center_scale_end=null"]
+            + overrides,
+        ))
+    assert (args.center_scale_start, args.center_scale_end) == expected
+
+
+@pytest.mark.parametrize("field", ["center_scale", "center_scale_start", "center_scale_end"])
+@pytest.mark.parametrize("value", ["-0.1", "true", "bad", ".nan", ".inf"])
+def test_center_scale_config_rejects_invalid_values(field, value):
+    from minimal_dino.config import to_train_args
+
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        config = compose(config_name="config", overrides=[f"objective.{field}={value}"])
+    with pytest.raises(ValueError, match=f"objective.{field}"):
+        to_train_args(config)
 
 
 def test_encoder_can_be_frozen_without_freezing_byol_head():
@@ -443,7 +519,7 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     alternate_args = to_train_args(alternate_config)
 
     assert default_args.objective == "byol"
-    assert default_args.augmentation == ["word", "dropout"]
+    assert default_args.augmentation == list(default_config.augmentation.names)
     assert default_args.quiet is True
     assert default_args.tensorboard is True
     assert default_args.byol_precision == "bf16"
@@ -463,7 +539,7 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     assert default_args.encoder_freeze_steps == default_config.optimization.encoder_freeze_steps
     assert default_args.max_length == 256
     assert default_args.num_workers == default_config.data.num_workers
-    assert default_args.max_steps == default_config.optimization.max_steps
+    assert default_args.max_steps == default_config.optimization.get("max_steps")
     assert default_args.eval_steps == default_config.evaluation.steps
     assert alternate_args.objective == "infonce"
     assert alternate_args.infonce_temp == 0.2

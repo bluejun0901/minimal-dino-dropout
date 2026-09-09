@@ -1,5 +1,6 @@
 """Recreate trajectory figures from the recorded evaluation metrics."""
 import json
+import re
 from pathlib import Path
 
 import matplotlib
@@ -15,11 +16,23 @@ RUNS = {
     "Word augmentation": ROOT / "runs/cls_polling",
     "DINO": ROOT / "archive/check_trajectory_dino_fin",
 }
-COLORS = ["#2563eb", "#e05469", "#0d9488"]
+COLORS = ["#2563eb", "#e05469", "#0d9488", "#9333ea"]
 records = {}
 for label, folder in RUNS.items():
     rows = [json.loads(line) for line in (folder / "metrics.jsonl").read_text().splitlines() if line.strip()]
     records[label] = sorted((r for r in rows if "sts_spearman" in r), key=lambda r: r["step"])
+
+soul_rows = []
+for line in (ROOT / "runs/soul/train_.log").read_text().splitlines():
+    match = re.match(r"\[step (\d+)\] EVAL (.*)", line)
+    if match:
+        values = {key: float(value) for key, value in re.findall(
+            r"(\w+)=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", match[2]
+        )}
+        soul_rows.append({"step": int(match[1]), "sts_spearman": values["sts_b_dev"],
+                          "alignment": values["alignment"], "uniformity": values["uniformity"]})
+records["SOUL"] = sorted(soul_rows, key=lambda r: r["step"])
+print(f"SOUL: {len(soul_rows)} evaluations, steps {soul_rows[0]['step']}–{soul_rows[-1]['step']}")
 
 plt.rcParams.update({"font.size": 11, "axes.spines.top": False, "axes.spines.right": False,
                      "axes.titleweight": "bold", "figure.facecolor": "white"})
@@ -52,7 +65,7 @@ for xkey, ykey, filename, title in [
         for i in range(0, len(points)-1, 3):
             ax.annotate("", xy=(x[i+1], y[i+1]), xytext=(x[i], y[i]),
                         arrowprops={"arrowstyle": "->", "color": color, "lw": 1.7})
-        start_offset = [(8, 12), (8, -24), (-12, -24)][run_index]
+        start_offset = [(8, 12), (8, -24), (-12, -24), (-12, 12)][run_index]
         for i, offset in [(0, start_offset), (len(points)-1, (-8, 24))]:
             ax.annotate(f"step {points[i]['step']}", (x[i], y[i]), xytext=offset,
                         textcoords="offset points", ha="left" if offset[0] > 0 else "right", color=color)
@@ -63,7 +76,7 @@ for xkey, ykey, filename, title in [
     handles += [Line2D([], [], marker="o", color="gray", markerfacecolor="white", linestyle="", label="Start"),
                 Line2D([], [], marker="*", color="gray", markersize=12, linestyle="", label="Final")]
     ax.legend(handles=handles, loc="best", framealpha=0.9)
-    fig.text(0.5, 0.025, "; ".join(missing) if missing else "Arrows indicate training direction; stars mark the final evaluation.",
+    fig.text(0.5, 0.025, "; ".join(missing) if missing else "Stars: last recorded evaluation. SOUL: sts_b_dev used as Spearman.",
              ha="center", fontsize=9, color="#64748b")
     finish(fig, ax, filename)
 
@@ -72,7 +85,7 @@ for (label, rows), color in zip(records.items(), COLORS):
     ax.plot([r["step"] for r in rows], [r["sts_spearman"] for r in rows], "o-", color=color, lw=2.3, label=label)
 ax.set(xlabel="Training step", ylabel="STS Spearman", title="Spearman over training")
 ax.legend()
-fig.text(0.5, 0.025, "Recorded evaluations only; all runs start at step 0.",
+fig.text(0.5, 0.025, "Recorded evaluations only. SOUL: sts_b_dev used as Spearman; last step 1499.",
          ha="center", fontsize=9, color="#64748b")
 finish(fig, ax, "spearman_steps.png")
 print(f"Saved four plots to {OUT}")

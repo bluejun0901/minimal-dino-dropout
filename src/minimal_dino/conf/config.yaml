@@ -1,7 +1,7 @@
 defaults:
   - data: default
   - model: bert_base
-  - augmentation: word_dropout
+  - augmentation: word
   - objective: byol
   - optimization: default
   - teacher: default

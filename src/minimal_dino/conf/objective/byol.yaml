@@ -1,3 +1,6 @@
 name: byol
 center_momentum: 0.96
 center_scale: 0.05
+# Null start falls back to center_scale; null end keeps the start value constant.
+center_scale_start: null
+center_scale_end: null

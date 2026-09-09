@@ -213,6 +213,15 @@ def cosine_teacher_momentum(step: int, total_steps: int, base_momentum: float) -
     return 1.0 - (1.0 - base_momentum) * (math.cos(math.pi * progress) + 1.0) / 2.0
 
 
+def cosine_center_scale(step: int, total_steps: int, start: float, end: float) -> float:
+    """Cosine-interpolate across optimizer steps, using start for a one-step run."""
+    if total_steps <= 1:
+        return start
+    progress = step / (total_steps - 1)
+    weight = (1.0 - math.cos(math.pi * progress)) / 2.0
+    return (1.0 - weight) * start + weight * end
+
+
 def set_encoder_trainable(model: SentenceBYOL, trainable: bool) -> None:
     """Freeze or unfreeze only the online encoder, leaving the BYOL head trainable."""
     model.encoder.requires_grad_(trainable)
@@ -534,6 +543,9 @@ def train(
                 set_encoder_trainable(student, True)
             completed_step = global_step + 1
             should_log = completed_step == 1 or completed_step % args.log_steps == 0
+            center_scale = cosine_center_scale(
+                global_step, total_steps, args.center_scale_start, args.center_scale_end
+            )
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -568,7 +580,7 @@ def train(
                                 dropout_probability=args.target_dropout,
                                 target=True,
                                 center=objective.center,
-                                center_scale=args.center_scale,
+                                center_scale=center_scale,
                             )
                             teacher_view2 = teacher(
                                 **batch,
@@ -576,7 +588,7 @@ def train(
                                 dropout_probability=args.target_dropout,
                                 target=True,
                                 center=objective.center,
-                                center_scale=args.center_scale,
+                                center_scale=center_scale,
                             )
                     else:
                         # Keep the existing InfoNCE execution path unchanged.
@@ -612,7 +624,7 @@ def train(
                             dropout_probability=args.target_dropout,
                             target=True,
                             center=objective.center if isinstance(objective, BYOLLoss) else None,
-                            center_scale=args.center_scale,
+                            center_scale=center_scale,
                         )
                         teacher_view2 = teacher(
                             **view2,
@@ -620,7 +632,7 @@ def train(
                             dropout_probability=args.target_dropout,
                             target=True,
                             center=objective.center if isinstance(objective, BYOLLoss) else None,
-                            center_scale=args.center_scale,
+                            center_scale=center_scale,
                         )
 
                 if isinstance(objective, BYOLLoss):
@@ -710,6 +722,8 @@ def train(
                     "pairwise_cosine": pairwise_cosine.item(),
                     **{name: value.item() for name, value in loss_metrics.items()},
                 }
+                if isinstance(objective, BYOLLoss):
+                    log["center_scale"] = center_scale
                 log_metrics(
                     args.output_dir,
                     log,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -70,12 +71,24 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
     ):
         raise ValueError("objective.center_momentum must be in [0, 1)")
     center_scale = objective.get("center_scale", 0.5)
-    if (
-        isinstance(center_scale, bool)
-        or not isinstance(center_scale, (int, float))
-        or center_scale < 0.0
+    center_scale_start = objective.get("center_scale_start")
+    if center_scale_start is None:
+        center_scale_start = center_scale
+    center_scale_end = objective.get("center_scale_end")
+    if center_scale_end is None:
+        center_scale_end = center_scale_start
+    for name, value in (
+        ("center_scale", center_scale),
+        ("center_scale_start", center_scale_start),
+        ("center_scale_end", center_scale_end),
     ):
-        raise ValueError("objective.center_scale must be a non-negative number")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0.0
+        ):
+            raise ValueError(f"objective.{name} must be a finite non-negative number")
 
     device = runtime["device"]
     if device == "auto":
@@ -101,9 +114,11 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         objective=objective["name"],
         center_momentum=center_momentum,
         center_scale=center_scale,
+        center_scale_start=center_scale_start,
+        center_scale_end=center_scale_end,
         infonce_temp=objective.get("temperature", 0.05),
         epochs=optimization["epochs"],
-        max_steps=optimization["max_steps"],
+        max_steps=optimization.get("max_steps"),
         batch_size=optimization["batch_size"],
         encoder_learning_rate=optimization["encoder_learning_rate"],
         head_learning_rate=optimization["head_learning_rate"],

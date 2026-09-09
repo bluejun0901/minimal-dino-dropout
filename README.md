@@ -52,9 +52,26 @@ independent warmup and linear decay through the shared scheduler.
 
 The raw target embedding is centered before it enters the projector. The center is an EMA of
 previous target-embedding batch means and is updated only after computing each batch loss. Configure
-its decay with `objective.center_momentum` (default `0.99`) and the multiplier applied before subtraction with
-`objective.center_scale` (default `0.5`); the center is stored in checkpoints and its norm is logged
-as `center_norm`.
+its decay with `objective.center_momentum` and the multiplier applied before subtraction with
+`objective.center_scale` (default `0.05`). For a cosine schedule, set the initial and final multipliers:
+
+```bash
+source .venv/bin/activate
+uv run python -m minimal_dino.train \
+  objective.center_scale_start=0.05 \
+  objective.center_scale_end=0.5
+```
+
+For zero-based step `t` and total optimizer steps `T`, the multiplier is
+`start + (end - start) * (1 - cos(pi * t / (T - 1))) / 2`:
+the first step uses `start` and the last uses `end`, with a smooth transition near both endpoints.
+The schedule includes encoder-freeze steps and respects the epoch and `optimization.max_steps`
+limits. A one-step run uses `start`. Increasing and decreasing schedules are supported.
+An unset (`null`) start falls back to `center_scale`; an unset end falls back to the start,
+preserving fixed-scale runs and existing tuning defaults. Resume uses the restored global step;
+keep the endpoints and total training schedule unchanged when resuming. The scale used for each
+logged BYOL step is recorded as `center_scale` in JSONL and `train/center_scale` in TensorBoard.
+The center itself is stored in checkpoints and its norm is logged as `center_norm`.
 
 The default `augmentation=word_dropout` combines two independently word-augmented views with
 independent encoder dropout masks. Online views use `model.dropout`; target views use independent,
