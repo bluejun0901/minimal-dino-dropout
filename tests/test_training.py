@@ -46,12 +46,13 @@ class TinyEncoder(nn.Module):
 
 
 @pytest.mark.parametrize("objective", ["byol", "infonce"])
+@pytest.mark.parametrize("uniformity_weight", [0.0, 0.1])
 @pytest.mark.parametrize("resume_step", [0, 1])
 @pytest.mark.parametrize(
     "augmentations", [["dropout"], ["word"], ["word", "dropout"], ["dropout", "word"]]
 )
 def test_training_applies_selected_augmentations(
-    tmp_path, monkeypatch, objective, augmentations, resume_step
+    tmp_path, monkeypatch, objective, augmentations, resume_step, uniformity_weight
 ):
     from minimal_dino.config import to_train_args
     from minimal_dino.train import train
@@ -63,6 +64,8 @@ def test_training_applies_selected_augmentations(
             config_name="config",
             overrides=[
                 f"objective={objective}",
+                f"objective.uniformity_weight={uniformity_weight}",
+                "objective.uniformity_t=1.5",
                 "augmentation.names=[" + ",".join(augmentations) + "]",
                 f"data.train_file={train_file}",
                 "data.num_workers=0",
@@ -125,6 +128,11 @@ def test_training_applies_selected_augmentations(
     monkeypatch.setattr(SentenceBYOL, "from_pretrained", build_model)
     monkeypatch.setattr("minimal_dino.data.augment_words", augment)
     monkeypatch.setattr("minimal_dino.train.save_run_artifacts", lambda *a, **k: None)
+    if uniformity_weight == 0:
+        def unexpected_uniformity(*a, **k):
+            pytest.fail("Disabled uniformity must not be computed")
+
+        monkeypatch.setattr("minimal_dino.train.UniformityLoss.forward", unexpected_uniformity)
 
     train(args, save_final_checkpoint=False)
 
@@ -154,6 +162,16 @@ def test_training_applies_selected_augmentations(
     ]
     assert [record["step"] for record in metrics] == list(range(resume_step + 1, 4))
     assert all(torch.isfinite(torch.tensor(record["loss"])) for record in metrics)
+    for record in metrics:
+        if uniformity_weight:
+            assert record["weighted_uniformity_loss"] == pytest.approx(
+                uniformity_weight * record["uniformity_loss"], abs=1e-7
+            )
+            assert record["loss"] == pytest.approx(
+                record["base_loss"] + record["weighted_uniformity_loss"], abs=1e-6
+            )
+        else:
+            assert "uniformity_loss" not in record
     if objective == "byol":
         expected_scales = [0.1, 0.3, 0.5][resume_step:]
         assert target_scales == pytest.approx([s for s in expected_scales for _ in range(2)])
@@ -246,6 +264,34 @@ def test_center_scale_config_rejects_invalid_values(field, value):
     with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
         config = compose(config_name="config", overrides=[f"objective.{field}={value}"])
     with pytest.raises(ValueError, match=f"objective.{field}"):
+        to_train_args(config)
+
+
+@pytest.mark.parametrize("objective", ["byol", "infonce"])
+@pytest.mark.parametrize("field", ["uniformity_weight", "uniformity_t"])
+@pytest.mark.parametrize("value", ["-0.1", "true", "bad", ".nan", ".inf"])
+def test_uniformity_config_rejects_invalid_values(objective, field, value):
+    from minimal_dino.config import to_train_args
+
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        config = compose(
+            config_name="config", overrides=[f"objective={objective}", f"objective.{field}={value}"]
+        )
+    with pytest.raises(ValueError, match=f"objective.{field}"):
+        to_train_args(config)
+
+
+@pytest.mark.parametrize("objective", ["byol", "infonce"])
+def test_uniformity_config_defaults_and_zero_t(objective):
+    from minimal_dino.config import to_train_args
+
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        config = compose(config_name="config", overrides=[f"objective={objective}"])
+    args = to_train_args(config)
+    assert args.uniformity_weight == 0.0
+    assert args.uniformity_t == 2.0
+    config.objective.uniformity_t = 0.0
+    with pytest.raises(ValueError, match="objective.uniformity_t"):
         to_train_args(config)
 
 
@@ -525,7 +571,7 @@ def test_hydra_config_groups_compose_and_translate_to_training_args():
     assert default_args.byol_precision == "bf16"
     assert default_args.random_init is False
     assert default_args.pooling == default_config.model.pooling
-    assert default_args.projection_dim == 256
+    assert default_args.projection_dim == default_config.model.projection_dim
     assert default_args.projector_hidden_dim == 4096
     assert default_args.predictor_hidden_dim == 4096
     assert default_args.target_dropout == 0.02

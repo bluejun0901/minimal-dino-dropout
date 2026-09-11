@@ -29,7 +29,7 @@ from minimal_dino.evaluation import (
     stsb_metrics,
 )
 from minimal_dino.model import BYOLOutput, SentenceBYOL, checkpoint_model_config, model_config
-from minimal_dino.objective import BYOLLoss, InfoNCELoss, build_objective
+from minimal_dino.objective import BYOLLoss, InfoNCELoss, UniformityLoss, build_objective
 
 DEFAULT_MODEL_NAME = "bert-base-uncased"
 DEFAULT_MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"
@@ -402,6 +402,7 @@ def train(
         center_momentum=args.center_momentum,
         infonce_temp=args.infonce_temp,
     ).to(device)
+    uniformity = UniformityLoss(args.uniformity_t) if args.uniformity_weight > 0 else None
     byol_precision = args.byol_precision
     if byol_precision not in {"fp32", "bf16"}:
         raise ValueError("runtime.byol_precision must be 'fp32' or 'bf16'")
@@ -647,6 +648,18 @@ def train(
                     loss, loss_metrics = objective(
                         (student_view1.embedding, student_view2.embedding)
                     )
+            if uniformity is not None:
+                uniformity_loss = (
+                    uniformity(student_view1.embedding) + uniformity(student_view2.embedding)
+                ) / 2
+                weighted_uniformity_loss = args.uniformity_weight * uniformity_loss
+                if should_log:
+                    loss_metrics.update(
+                        base_loss=loss.detach(),
+                        uniformity_loss=uniformity_loss.detach(),
+                        weighted_uniformity_loss=weighted_uniformity_loss.detach(),
+                    )
+                loss = loss + weighted_uniformity_loss
             if optimize_byol_cuda:
                 torch._assert_async(
                     torch.isfinite(loss), f"Non-finite loss at step {global_step}"

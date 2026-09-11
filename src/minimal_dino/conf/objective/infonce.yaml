@@ -1,2 +1,5 @@
 name: infonce
 temperature: 0.05
+# Optional Wang & Isola uniformity on pooled student embeddings; 0 disables it.
+uniformity_weight: 0.0
+uniformity_t: 2.0

@@ -1,8 +1,42 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+class UniformityLoss(nn.Module):
+    """Wang & Isola (2020): log mean exp(-t ||z_i - z_j||²), for i < j.
+
+    Inputs are pooled sentence embeddings; normalization and pair distances use
+    FP32 even during mixed-precision training. Batches with fewer than two
+    samples contribute a differentiable zero because they contain no pairs.
+    """
+
+    def __init__(self, t: float = 2.0) -> None:
+        super().__init__()
+        if (
+            isinstance(t, bool)
+            or not isinstance(t, (int, float))
+            or not math.isfinite(t)
+            or t <= 0
+        ):
+            raise ValueError("uniformity t must be a finite positive number")
+        self.t = t
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=embeddings.device.type, enabled=False):
+            embeddings = embeddings.float()
+            if embeddings.shape[0] < 2:
+                return embeddings.sum() * 0.0
+            normalized = F.normalize(embeddings, dim=-1)
+            squared_distances = torch.pdist(normalized, p=2).square()
+            # logsumexp avoids underflow for large t without changing the loss.
+            return torch.logsumexp(-self.t * squared_distances, dim=0) - math.log(
+                squared_distances.numel()
+            )
 
 
 class BYOLLoss(nn.Module):

@@ -90,6 +90,21 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         ):
             raise ValueError(f"objective.{name} must be a finite non-negative number")
 
+    uniformity_weight = objective.get("uniformity_weight", 0.0)
+    uniformity_t = objective.get("uniformity_t", 2.0)
+    for name, value, allow_zero in (
+        ("uniformity_weight", uniformity_weight, True),
+        ("uniformity_t", uniformity_t, False),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or (value < 0 if allow_zero else value <= 0)
+        ):
+            bound = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"objective.{name} must be a finite {bound} number")
+
     device = runtime["device"]
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -117,6 +132,8 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         center_scale_start=center_scale_start,
         center_scale_end=center_scale_end,
         infonce_temp=objective.get("temperature", 0.05),
+        uniformity_weight=uniformity_weight,
+        uniformity_t=uniformity_t,
         epochs=optimization["epochs"],
         max_steps=optimization.get("max_steps"),
         batch_size=optimization["batch_size"],

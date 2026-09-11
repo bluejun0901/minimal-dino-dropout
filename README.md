@@ -86,6 +86,35 @@ Hydra writes its resolved config under the run directory. Full checkpoints conta
 target networks, objective, optimizer, scheduler, RNG state, architecture config, and tokenizer.
 Old DINO checkpoints and DINO configuration keys are intentionally unsupported.
 
+### Optional uniformity loss
+
+Add [Wang & Isola's uniformity loss](https://github.com/ssnl/align_uniform) to either objective:
+
+```bash
+source .venv/bin/activate
+uv run python -m minimal_dino.train \
+  objective=byol \
+  objective.uniformity_weight=0.1 \
+  objective.uniformity_t=2.0
+```
+
+`objective=infonce` accepts the same options. The default weight is `0.0`, which skips the
+additional computation and preserves the original loss. The weight must be finite and
+non-negative; `uniformity_t` must be finite and positive (default `2.0`).
+
+For each augmented student view, L2-normalize the pooled encoder embeddings before the head and
+compute `U(z) = log mean_{i<j} exp(-t * ||z_i - z_j||²)`. Training minimizes
+`base_loss + uniformity_weight * (U(view1) + U(view2)) / 2`. Pairs are formed within each
+view, excluding self-pairs; the two views of the same sentence are not repelled from each other.
+Distances and the stable log-mean-exp reduction use FP32, including in BF16 runs. A minibatch
+with fewer than two sentences contributes zero. Uniformity updates the student encoder only,
+so it has no training effect while the encoder is frozen.
+
+When enabled, JSONL and TensorBoard record `base_loss`, `uniformity_loss`, and
+`weighted_uniformity_loss`; `loss` is the total used for backpropagation. Uniformity can be
+negative, so the total loss can also be negative. Keep these options unchanged when resuming;
+they are saved in the run configuration and checkpoint arguments.
+
 ## Resume and evaluate
 
 ```bash
