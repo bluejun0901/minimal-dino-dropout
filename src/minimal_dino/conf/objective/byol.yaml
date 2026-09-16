@@ -5,5 +5,6 @@ center_scale: 0.0
 center_scale_start: null
 center_scale_end: null
 # Optional Wang & Isola uniformity on pooled student embeddings; 0 disables it.
-uniformity_weight: 0.02
+uniformity_weight: 0.005
 uniformity_t: 2.0
+uniformity_mode: normalized_mean

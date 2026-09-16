@@ -92,6 +92,9 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
 
     uniformity_weight = objective.get("uniformity_weight", 0.0)
     uniformity_t = objective.get("uniformity_t", 2.0)
+    uniformity_mode = objective.get("uniformity_mode", "normalized_mean")
+    if uniformity_mode not in {"normalized_mean", "decoupled"}:
+        raise ValueError("objective.uniformity_mode must be 'normalized_mean' or 'decoupled'")
     for name, value, allow_zero in (
         ("uniformity_weight", uniformity_weight, True),
         ("uniformity_t", uniformity_t, False),
@@ -134,6 +137,7 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
         infonce_temp=objective.get("temperature", 0.05),
         uniformity_weight=uniformity_weight,
         uniformity_t=uniformity_t,
+        uniformity_mode=uniformity_mode,
         epochs=optimization["epochs"],
         max_steps=optimization.get("max_steps"),
         batch_size=optimization["batch_size"],

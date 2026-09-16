@@ -46,13 +46,22 @@ class TinyEncoder(nn.Module):
 
 
 @pytest.mark.parametrize("objective", ["byol", "infonce"])
-@pytest.mark.parametrize("uniformity_weight", [0.0, 0.1])
+@pytest.mark.parametrize(
+    "uniformity_weight,uniformity_mode",
+    [(0.0, "normalized_mean"), (0.1, "normalized_mean"), (0.1, "decoupled")],
+)
 @pytest.mark.parametrize("resume_step", [0, 1])
 @pytest.mark.parametrize(
     "augmentations", [["dropout"], ["word"], ["word", "dropout"], ["dropout", "word"]]
 )
 def test_training_applies_selected_augmentations(
-    tmp_path, monkeypatch, objective, augmentations, resume_step, uniformity_weight
+    tmp_path,
+    monkeypatch,
+    objective,
+    augmentations,
+    resume_step,
+    uniformity_weight,
+    uniformity_mode,
 ):
     from minimal_dino.config import to_train_args
     from minimal_dino.train import train
@@ -65,6 +74,7 @@ def test_training_applies_selected_augmentations(
             overrides=[
                 f"objective={objective}",
                 f"objective.uniformity_weight={uniformity_weight}",
+                f"objective.uniformity_mode={uniformity_mode}",
                 "objective.uniformity_t=1.5",
                 "augmentation.names=[" + ",".join(augmentations) + "]",
                 f"data.train_file={train_file}",
@@ -288,8 +298,14 @@ def test_uniformity_config_defaults_and_zero_t(objective):
     with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
         config = compose(config_name="config", overrides=[f"objective={objective}"])
     args = to_train_args(config)
-    assert args.uniformity_weight == 0.0
+    assert args.uniformity_weight == config.objective.uniformity_weight
     assert args.uniformity_t == 2.0
+    assert args.uniformity_mode == "normalized_mean"
+    del config.objective.uniformity_weight
+    del config.objective.uniformity_mode
+    legacy_args = to_train_args(config)
+    assert legacy_args.uniformity_weight == 0.0
+    assert legacy_args.uniformity_mode == "normalized_mean"
     config.objective.uniformity_t = 0.0
     with pytest.raises(ValueError, match="objective.uniformity_t"):
         to_train_args(config)

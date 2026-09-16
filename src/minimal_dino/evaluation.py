@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -175,27 +176,99 @@ def load_checkpoint(path: str | Path, device: torch.device) -> tuple[SentenceBYO
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a minimal BYOL checkpoint on STS-B")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a sentence checkpoint on STS-B, STS7, or PAWS"
+    )
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--split", default="validation", choices=("validation", "test"))
+    parser.add_argument("--suite", default="stsb", choices=("stsb", "sts7", "paws"))
+    parser.add_argument(
+        "--split",
+        choices=("validation", "test"),
+        help="Default: validation for stsb, test for sts7/paws; sts7 is test only",
+    )
     parser.add_argument("--stsb-dir", default="data/stsb")
+    parser.add_argument(
+        "--paws-dir", default="data/paws", help="Local PAWS labeled_final Parquet dir"
+    )
+    parser.add_argument(
+        "--paws-threshold",
+        type=float,
+        help="Fixed cosine threshold; default: select on PAWS validation by accuracy",
+    )
+    parser.add_argument(
+        "--senteval-dir",
+        default="data/senteval",
+        help="SentEval downstream directory containing STS/ and SICK/ (sts7 only)",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--limit", type=int)
+    parser.add_argument("--limit", type=int, help="Limit pairs per task for a smoke test")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--output", type=Path, help="Also save the JSON results to this file")
     args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
+    if args.limit is not None and args.limit < 2:
+        parser.error("--limit must be at least 2 for correlation evaluation")
+    if args.suite == "sts7" and args.split == "validation":
+        parser.error("--suite sts7 uses test data; omit --split or pass --split test")
+    if args.paws_threshold is not None:
+        if args.suite != "paws":
+            parser.error("--paws-threshold requires --suite paws")
+        if not math.isfinite(args.paws_threshold):
+            parser.error("--paws-threshold must be finite")
+    if args.suite == "paws" and args.split == "validation" and args.paws_threshold is None:
+        parser.error("PAWS validation evaluation requires an explicit --paws-threshold")
 
     device = torch.device(args.device)
-    dataset = load_stsb_split(args.stsb_dir, args.split)
-    model, tokenizer = load_checkpoint(args.checkpoint, device)
-    metrics = evaluate_stsb(
-        model,
-        tokenizer,
-        dataset,
-        device=device,
-        batch_size=args.batch_size,
-        limit=args.limit,
-    )
-    print(json.dumps(metrics, indent=2, sort_keys=True))
+    if args.suite == "paws":
+        from minimal_dino.paws_evaluation import evaluate_paws, load_paws_split
+
+        split = args.split or "test"
+        dataset = load_paws_split(args.paws_dir, split)
+        validation_dataset = (
+            load_paws_split(args.paws_dir, "validation") if args.paws_threshold is None else None
+        )
+        model, tokenizer = load_checkpoint(args.checkpoint, device)
+        metrics = evaluate_paws(
+            model,
+            tokenizer,
+            dataset,
+            device=device,
+            validation_dataset=validation_dataset,
+            threshold=args.paws_threshold,
+            batch_size=args.batch_size,
+            limit=args.limit,
+        )
+        metrics["split"] = split
+    elif args.suite == "sts7":
+        from minimal_dino.sts_evaluation import evaluate_sts_suite, load_sts_suite
+
+        datasets = load_sts_suite(args.senteval_dir)
+        model, tokenizer = load_checkpoint(args.checkpoint, device)
+        metrics = evaluate_sts_suite(
+            model,
+            tokenizer,
+            datasets,
+            device=device,
+            batch_size=args.batch_size,
+            limit=args.limit,
+        )
+    else:
+        dataset = load_stsb_split(args.stsb_dir, args.split or "validation")
+        model, tokenizer = load_checkpoint(args.checkpoint, device)
+        metrics = evaluate_stsb(
+            model,
+            tokenizer,
+            dataset,
+            device=device,
+            batch_size=args.batch_size,
+            limit=args.limit,
+        )
+    result = json.dumps(metrics, indent=2, sort_keys=True)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(result + "\n", encoding="utf-8")
+    print(result)
 
 
 if __name__ == "__main__":

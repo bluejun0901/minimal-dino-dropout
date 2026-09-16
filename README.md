@@ -102,11 +102,14 @@ uv run python -m minimal_dino.train \
 additional computation and preserves the original loss. The weight must be finite and
 non-negative; `uniformity_t` must be finite and positive (default `2.0`).
 
-For each augmented student view, L2-normalize the pooled encoder embeddings before the head and
-compute `U(z) = log mean_{i<j} exp(-t * ||z_i - z_j||²)`. Training minimizes
-`base_loss + uniformity_weight * (U(view1) + U(view2)) / 2`. Pairs are formed within each
-view, excluding self-pairs; the two views of the same sentence are not repelled from each other.
-Distances and the stable log-mean-exp reduction use FP32, including in BF16 runs. A minibatch
+Average the two augmented student views' pooled encoder embeddings before the head for each
+sentence, then L2-normalize these mean embeddings and compute
+`U(z) = log mean_{i<j} exp(-t * ||z_i - z_j||²)`. Training minimizes
+`base_loss + uniformity_weight * U((view1 + view2) / 2)`, where `U` normalizes its input.
+Pairs are formed between different sentences' mean embeddings, excluding self-pairs;
+the two views of the same sentence are not directly repelled from each other.
+View averaging, normalization, distances, and the stable log-mean-exp reduction use FP32,
+including in BF16 runs. A minibatch
 with fewer than two sentences contributes zero. Uniformity updates the student encoder only,
 so it has no training effect while the encoder is frozen.
 
@@ -131,6 +134,93 @@ uv run python -m minimal_dino.evaluation \
 
 Do not change the training schedule or model dimensions when resuming. Evaluation uses the online
 encoder without augmentation and reports STS correlations plus collapse diagnostics.
+
+### STS seven-task average
+
+Evaluate **STS12, STS13, STS14, STS15, STS16, STSBenchmark (STS-B), and
+SICKRelatedness (SICK-R)** using the same saved online encoder and pooling configuration.
+Download the [SimCSE SentEval data](https://github.com/princeton-nlp/SimCSE/tree/main/SentEval/data/downstream)
+once; evaluation reads local files and does not require installing SentEval:
+
+```bash
+mkdir -p data/senteval
+curl -fL https://huggingface.co/datasets/princeton-nlp/datasets-for-simcse/resolve/main/senteval.tar \
+  -o data/senteval.tar
+tar -xf data/senteval.tar -C data/senteval STS SICK
+
+source .venv/bin/activate
+uv run python -m minimal_dino.evaluation \
+  --checkpoint runs/byol-mean-bert-base-seed42/checkpoint.pt \
+  --suite sts7 \
+  --senteval-dir data/senteval \
+  --batch-size 64 \
+  --device cuda \
+  --output runs/byol-mean-bert-base-seed42/sts7.json
+```
+
+`--senteval-dir` must contain `STS/STS12-en-test/` through `STS/STS16-en-test/`,
+`STS/STSBenchmark/sts-test.csv`, and `SICK/SICK_test_annotated.txt`. An existing
+`SentEval/data/downstream` directory also works. STS7 always uses the test sets;
+`--split validation` is rejected. The existing STS-B-only command still defaults to validation
+and reads `--stsb-dir` Parquet files. STS7 reads STS-B from the SentEval bundle instead.
+
+JSON output includes each task's cosine Spearman/Pearson correlation and pair count under
+`datasets`, plus `sts_spearman_mean` and `sts_pearson_mean`. Correlations use the **-1 to 1**
+scale; multiply by 100 for paper-style scores. Following
+[SimCSE's evaluation protocol](https://github.com/princeton-nlp/SimCSE/blob/main/evaluation.py),
+each annual STS score is computed over all its labeled subsets concatenated together
+(STS13 excludes SMT); the final average gives each of the seven tasks equal weight.
+The average uses unrounded values. Missing files fail evaluation instead of silently dropping
+a task. Undefined correlations remain NaN and propagate to the average.
+
+Add `--limit 100` for a quick smoke test; this takes the first 100 labeled pairs **per task**
+and is not the full benchmark score. STS7 skips the quadratic collapse diagnostics used by
+STS-B evaluation, computing only correlations. Training-time evaluation and tuning continue
+to use STS-B validation.
+
+### PAWS paraphrase evaluation
+
+Evaluate the English **PAWS-Wiki Labeled Final** binary paraphrase task with cosine
+similarity from the saved encoder. Label `1` means paraphrase and `0` means different
+meaning; see the [PAWS dataset documentation](https://github.com/google-research-datasets/paws).
+Download the validation and test splits from the
+[Hugging Face distribution](https://huggingface.co/datasets/google-research-datasets/paws):
+
+```bash
+mkdir -p data/paws
+for split in validation test; do
+  curl -fL "https://huggingface.co/datasets/google-research-datasets/paws/resolve/main/labeled_final/${split}-00000-of-00001.parquet" \
+    -o "data/paws/${split}.parquet"
+done
+
+source .venv/bin/activate
+uv run python -m minimal_dino.evaluation \
+  --checkpoint runs/byol-mean-bert-base-seed42/checkpoint.pt \
+  --suite paws \
+  --paws-dir data/paws \
+  --device cuda \
+  --output runs/byol-mean-bert-base-seed42/paws.json
+```
+
+The default evaluates the **test** split. It first selects a cosine threshold that
+maximizes **validation accuracy**, freezes that threshold, then computes test metrics.
+Test labels are never used for threshold selection. Ties in validation accuracy select
+the highest threshold. A pair is predicted to be a paraphrase when its cosine similarity
+is greater than or equal to the threshold. The encoder is not trained or updated.
+
+JSON output reports `roc_auc`, `average_precision` (non-interpolated AP), `accuracy`,
+`precision`, `recall`, `f1`, confusion counts, and `num_pairs`. Metrics use the **0 to 1**
+scale. ROC-AUC and AP are threshold-independent; accuracy and F1 use the reported
+`threshold`. `threshold_source` records `validation_accuracy` or `fixed`, and `validation`
+contains calibration metrics when applicable. These are frozen-embedding cosine scores,
+not the supervised classifiers reported in the PAWS paper.
+
+To evaluate with no label-based calibration, add `--paws-threshold 0.5` (or another
+fixed threshold); this needs only `test.parquet`. `--split validation` is also supported
+with an explicit `--paws-threshold`, so evaluation never implicitly tunes on the same split.
+`--limit 100` limits both test and validation to their first 100 pairs for smoke testing.
+Both classes must be present; malformed data or a single-class sample raises an error.
+This command uses PAWS-Wiki Labeled Final, not PAWS-QQP or multilingual PAWS-X.
 
 ## Hyperparameter tuning
 

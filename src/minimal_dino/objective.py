@@ -39,6 +39,41 @@ class UniformityLoss(nn.Module):
             )
 
 
+class DecoupledUniformityLoss(nn.Module):
+    """Dufumier et al. (ICML 2023): Gaussian repulsion between view centroids.
+
+    Normalize each view BEFORE averaging and do NOT normalize the centroid:
+    its squared norm is 1 - ||z1 - z2||² / 4 and retains alignment information.
+    This implements the non-kernel two-view variant, with configurable t.
+    """
+
+    def __init__(self, t: float = 2.0) -> None:
+        super().__init__()
+        if (
+            isinstance(t, bool)
+            or not isinstance(t, (int, float))
+            or not math.isfinite(t)
+            or t <= 0
+        ):
+            raise ValueError("uniformity t must be a finite positive number")
+        self.t = t
+
+    def forward(self, views: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        first, second = views
+        if first.ndim != 2 or first.shape != second.shape:
+            raise ValueError("decoupled uniformity requires two matching [batch, dim] views")
+        with torch.autocast(device_type=first.device.type, enabled=False):
+            centroid = (
+                F.normalize(first.float(), dim=-1) + F.normalize(second.float(), dim=-1)
+            ) / 2
+            if centroid.shape[0] < 2:
+                return centroid.sum() * 0.0
+            squared_distances = torch.pdist(centroid, p=2).square()
+            return torch.logsumexp(-self.t * squared_distances, dim=0) - math.log(
+                squared_distances.numel()
+            )
+
+
 class BYOLLoss(nn.Module):
     """Symmetric BYOL regression with an EMA center for target embeddings."""
 
