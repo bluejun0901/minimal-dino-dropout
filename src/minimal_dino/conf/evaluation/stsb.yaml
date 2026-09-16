@@ -1,5 +1,5 @@
 steps: 300
 batch_size: 128
 limit: null
-stsb_dir: data/stsb
+stsb_dir: /workspace/data/stsb
 collapse_warning_after: 100
