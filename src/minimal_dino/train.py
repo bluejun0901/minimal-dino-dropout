@@ -7,6 +7,7 @@ import math
 import random
 import re
 import subprocess
+import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,15 +25,17 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from minimal_dino.config import config_to_container, to_train_args
 from minimal_dino.data import TextLineDataset, TokenizeCollator, WordViewCollator
 from minimal_dino.evaluation import (
-    encode_stsb_dataset,
+    encode_stsb_dataset_with_head,
     load_stsb_split,
-    stsb_metrics,
+    stsb_metrics_with_head,
 )
 from minimal_dino.model import BYOLOutput, SentenceBYOL, checkpoint_model_config, model_config
 from minimal_dino.objective import (
     BYOLLoss,
+    CovarianceLoss,
     DecoupledUniformityLoss,
     InfoNCELoss,
+    KoLeoLoss,
     UniformityLoss,
     build_objective,
 )
@@ -181,11 +184,36 @@ def load_max_logged_metric(output_dir: str | Path, name: str) -> float | None:
     return maximum
 
 
-def _print_progress(step: int, total_steps: int, width: int = 30) -> None:
+def _format_duration(seconds: float) -> str:
+    """Format a non-negative duration as ``HH:MM:SS``."""
+    total_seconds = max(0, math.ceil(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _print_progress(
+    step: int,
+    total_steps: int,
+    width: int = 30,
+    *,
+    elapsed_seconds: float | None = None,
+) -> None:
+    """Render quiet-mode training progress, including an ETA when available."""
     filled = int(width * step / total_steps)
     bar = "#" * filled + "-" * (width - filled)
+    eta = ""
+    if elapsed_seconds is not None:
+        remaining_seconds = (
+            (total_steps - step) * elapsed_seconds / step if step > 0 else None
+        )
+        eta = (
+            f" ETA {_format_duration(remaining_seconds)}"
+            if remaining_seconds is not None
+            else " ETA --:--:--"
+        )
     print(
-        f"\rTraining [{bar}] {step}/{total_steps}",
+        f"\rTraining [{bar}] {step}/{total_steps}{eta}",
         end="\n" if step >= total_steps else "",
         flush=True,
     )
@@ -273,6 +301,24 @@ def off_diagonal_cosine(embeddings: torch.Tensor) -> torch.Tensor:
     similarities = normalized @ normalized.T
     indices = torch.triu_indices(embeddings.shape[0], embeddings.shape[0], offset=1)
     return similarities[indices[0], indices[1]].mean()
+
+
+def embedding_covariance_metrics(
+    embeddings: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return mean per-dimension variance and mean squared off-diagonal covariance."""
+    embeddings = embeddings.detach().float()
+    per_dim_variance_mean = embeddings.var(dim=0, unbiased=False).mean()
+    if embeddings.shape[0] < 2 or embeddings.shape[1] < 2:
+        return per_dim_variance_mean, embeddings.new_zeros(())
+
+    centered = embeddings - embeddings.mean(dim=0, keepdim=True)
+    covariance = centered.T @ centered / (embeddings.shape[0] - 1)
+    off_diagonal = ~torch.eye(
+        covariance.shape[0], dtype=torch.bool, device=covariance.device
+    )
+    covariance_squared_mean = covariance[off_diagonal].square().mean()
+    return per_dim_variance_mean, covariance_squared_mean
 
 
 def save_checkpoint(
@@ -408,12 +454,14 @@ def train(
         center_momentum=args.center_momentum,
         infonce_temp=args.infonce_temp,
     ).to(device)
-    uniformity_type = (
-        DecoupledUniformityLoss
-        if getattr(args, "uniformity_mode", "normalized_mean") == "decoupled"
-        else UniformityLoss
-    )
-    uniformity = uniformity_type(args.uniformity_t) if args.uniformity_weight > 0 else None
+    uniformity_mode = getattr(args, "uniformity_mode", "normalized_mean")
+    uniformity_types = {
+        "normalized_mean": lambda: UniformityLoss(args.uniformity_t),
+        "decoupled": lambda: DecoupledUniformityLoss(args.uniformity_t),
+        "koleo": KoLeoLoss,
+        "covariance": CovarianceLoss,
+    }
+    uniformity = uniformity_types[uniformity_mode]() if args.uniformity_weight > 0 else None
     byol_precision = args.byol_precision
     if byol_precision not in {"fp32", "bf16"}:
         raise ValueError("runtime.byol_precision must be 'fp32' or 'bf16'")
@@ -492,21 +540,27 @@ def train(
 
     step_zero_eval_metrics = None
     max_sts_spearman = load_max_logged_metric(args.output_dir, "sts_spearman")
+    max_head_sts_spearman = load_max_logged_metric(args.output_dir, "head/sts_spearman")
     if evaluation_dataset is not None:
-        embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
-            student,
-            tokenizer,
-            evaluation_dataset,
-            device=device,
-            batch_size=args.eval_batch_size,
-            limit=args.eval_limit,
+        embedding1, embedding2, projection1, projection2, evaluation_scores = (
+            encode_stsb_dataset_with_head(
+                student,
+                tokenizer,
+                evaluation_dataset,
+                device=device,
+                batch_size=args.eval_batch_size,
+                limit=args.eval_limit,
+            )
         )
-        step_zero_eval_metrics = stsb_metrics(
+        step_zero_eval_metrics = stsb_metrics_with_head(
             embedding1,
             embedding2,
+            projection1,
+            projection2,
             evaluation_scores,
         )
 
+    progress_started_at = time.monotonic()
     global_step = 0
     if args.resume_from_checkpoint:
         global_step = restore_checkpoint(
@@ -515,7 +569,11 @@ def train(
         if global_step >= total_steps:
             raise ValueError("Checkpoint has already reached the requested total training steps")
         if args.quiet:
-            _print_progress(global_step, total_steps)
+            _print_progress(
+                global_step,
+                total_steps,
+                elapsed_seconds=time.monotonic() - progress_started_at,
+            )
         else:
             print(f"Resumed from {args.resume_from_checkpoint} at step {global_step}", flush=True)
     elif step_zero_eval_metrics is not None:
@@ -523,9 +581,14 @@ def train(
             max_sts_spearman if max_sts_spearman is not None else -math.inf,
             step_zero_eval_metrics["sts_spearman"],
         )
+        max_head_sts_spearman = max(
+            max_head_sts_spearman if max_head_sts_spearman is not None else -math.inf,
+            step_zero_eval_metrics["head/sts_spearman"],
+        )
         step_zero_eval_metrics = {
             **step_zero_eval_metrics,
             "max_sts_spearman": max_sts_spearman,
+            "head/max_sts_spearman": max_head_sts_spearman,
         }
         log_metrics(
             args.output_dir,
@@ -541,6 +604,8 @@ def train(
     set_encoder_trainable(student, global_step >= args.encoder_freeze_steps)
     student.train()
     optimizer.zero_grad(set_to_none=True)
+    if args.quiet and global_step == 0:
+        _print_progress(global_step, total_steps, elapsed_seconds=0)
     start_epoch = global_step // steps_per_epoch
     resume_batch = global_step % steps_per_epoch
     for epoch in range(start_epoch, args.epochs):
@@ -721,6 +786,9 @@ def train(
                 embedding_std = (
                     student_view1.embedding.detach().float().std(dim=0, unbiased=False).mean()
                 )
+                per_dim_variance_mean, covariance_squared_mean = (
+                    embedding_covariance_metrics(student_view1.embedding)
+                )
                 if (
                     not collapse_warning_emitted
                     and global_step >= args.collapse_warning_after
@@ -735,8 +803,12 @@ def train(
                     collapse_warning_emitted = True
 
             global_step += 1
-            if args.quiet and (should_log or global_step == total_steps):
-                _print_progress(global_step, total_steps)
+            if args.quiet:
+                _print_progress(
+                    global_step,
+                    total_steps,
+                    elapsed_seconds=time.monotonic() - progress_started_at,
+                )
             if should_log:
                 log = {
                     "step": global_step,
@@ -749,6 +821,8 @@ def train(
                     "student_view_cosine": student_view_cosine.item(),
                     "teacher_view_cosine": teacher_view_cosine.item(),
                     "embedding_std": embedding_std.item(),
+                    "per_dim_variance_mean": per_dim_variance_mean.item(),
+                    "covariance_squared_mean": covariance_squared_mean.item(),
                     "pairwise_cosine": pairwise_cosine.item(),
                     **{name: value.item() for name, value in loss_metrics.items()},
                 }
@@ -765,24 +839,38 @@ def train(
             if args.eval_steps and global_step % args.eval_steps == 0:
                 if evaluation_dataset is None:
                     raise RuntimeError("Evaluation data was not initialized")
-                embedding1, embedding2, evaluation_scores = encode_stsb_dataset(
-                    student,
-                    tokenizer,
-                    evaluation_dataset,
-                    device=device,
-                    batch_size=args.eval_batch_size,
-                    limit=args.eval_limit,
+                embedding1, embedding2, projection1, projection2, evaluation_scores = (
+                    encode_stsb_dataset_with_head(
+                        student,
+                        tokenizer,
+                        evaluation_dataset,
+                        device=device,
+                        batch_size=args.eval_batch_size,
+                        limit=args.eval_limit,
+                    )
                 )
-                metrics = stsb_metrics(
+                metrics = stsb_metrics_with_head(
                     embedding1,
                     embedding2,
+                    projection1,
+                    projection2,
                     evaluation_scores,
                 )
                 max_sts_spearman = max(
                     max_sts_spearman if max_sts_spearman is not None else -math.inf,
                     metrics["sts_spearman"],
                 )
-                metrics = {**metrics, "max_sts_spearman": max_sts_spearman}
+                max_head_sts_spearman = max(
+                    max_head_sts_spearman
+                    if max_head_sts_spearman is not None
+                    else -math.inf,
+                    metrics["head/sts_spearman"],
+                )
+                metrics = {
+                    **metrics,
+                    "max_sts_spearman": max_sts_spearman,
+                    "head/max_sts_spearman": max_head_sts_spearman,
+                }
                 log_metrics(
                     args.output_dir,
                     {"step": global_step, **metrics},

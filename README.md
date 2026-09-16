@@ -86,37 +86,46 @@ Hydra writes its resolved config under the run directory. Full checkpoints conta
 target networks, objective, optimizer, scheduler, RNG state, architecture config, and tokenizer.
 Old DINO checkpoints and DINO configuration keys are intentionally unsupported.
 
-### Optional uniformity loss
+### Optional embedding regularizer
 
-Add [Wang & Isola's uniformity loss](https://github.com/ssnl/align_uniform) to either objective:
+Add an embedding regularizer to either objective:
 
 ```bash
 source .venv/bin/activate
 uv run python -m minimal_dino.train \
   objective=byol \
   objective.uniformity_weight=0.1 \
+  objective.uniformity_mode=koleo \
   objective.uniformity_t=2.0
 ```
 
 `objective=infonce` accepts the same options. The default weight is `0.0`, which skips the
 additional computation and preserves the original loss. The weight must be finite and
-non-negative; `uniformity_t` must be finite and positive (default `2.0`).
+non-negative. `uniformity_mode` supports:
 
-Average the two augmented student views' pooled encoder embeddings before the head for each
-sentence, then L2-normalize these mean embeddings and compute
+- `normalized_mean`: Wang & Isola uniformity on the mean of the two student views.
+- `decoupled`: Wang & Isola uniformity after normalizing each view before averaging.
+- `koleo`: KoLeo nearest-neighbor entropy loss on the mean embeddings.
+- `covariance`: VICReg-style squared off-diagonal covariance loss on the mean embeddings.
+
+`uniformity_t` must be finite and positive (default `2.0`) and is used only by
+`normalized_mean` and `decoupled`.
+
+In `normalized_mean` mode, average the two augmented student views' pooled encoder embeddings
+before the head for each sentence, then L2-normalize these mean embeddings and compute
 `U(z) = log mean_{i<j} exp(-t * ||z_i - z_j||²)`. Training minimizes
 `base_loss + uniformity_weight * U((view1 + view2) / 2)`, where `U` normalizes its input.
 Pairs are formed between different sentences' mean embeddings, excluding self-pairs;
 the two views of the same sentence are not directly repelled from each other.
 View averaging, normalization, distances, and the stable log-mean-exp reduction use FP32,
 including in BF16 runs. A minibatch
-with fewer than two sentences contributes zero. Uniformity updates the student encoder only,
+with fewer than two sentences contributes zero. The regularizer updates the student encoder only,
 so it has no training effect while the encoder is frozen.
 
 When enabled, JSONL and TensorBoard record `base_loss`, `uniformity_loss`, and
 `weighted_uniformity_loss`; `loss` is the total used for backpropagation. Uniformity can be
-negative, so the total loss can also be negative. Keep these options unchanged when resuming;
-they are saved in the run configuration and checkpoint arguments.
+negative in the Wang & Isola and KoLeo modes, so the total loss can also be negative. Keep these
+options unchanged when resuming; they are saved in the run configuration and checkpoint arguments.
 
 ## Resume and evaluate
 
@@ -250,7 +259,9 @@ uv run python -m minimal_dino.tune \
 
 Training logs BYOL cosine, online prediction standard deviation, target projection standard
 deviation, gradient norm, view cosine, embedding standard deviation, and pairwise cosine to
-`metrics.jsonl` and TensorBoard. Plot logs with:
+`metrics.jsonl` and TensorBoard. STS-B evaluation logs the same correlation and collapse metrics
+for projector outputs under `head/` in JSONL and `eval/head/` in TensorBoard, for example
+`eval/head/sts_spearman`, `eval/head/sts_pearson`, and `eval/head/effective_rank`. Plot logs with:
 
 ```bash
 uv run python -m minimal_dino.plot_metrics runs/example/metrics.jsonl

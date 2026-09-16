@@ -74,6 +74,45 @@ class DecoupledUniformityLoss(nn.Module):
             )
 
 
+class KoLeoLoss(nn.Module):
+    """Kozachenko-Leonenko entropy regularizer over nearest-neighbor distances."""
+
+    def __init__(self, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=embeddings.device.type, enabled=False):
+            embeddings = F.normalize(embeddings.float(), dim=-1)
+            if embeddings.shape[0] < 2:
+                return embeddings.sum() * 0.0
+            similarities = embeddings @ embeddings.T
+            similarities = similarities.masked_fill(
+                torch.eye(
+                    embeddings.shape[0], dtype=torch.bool, device=embeddings.device
+                ),
+                -torch.inf,
+            )
+            nearest_similarity = similarities.max(dim=1).values
+            nearest_distance = (2.0 - 2.0 * nearest_similarity).clamp_min(self.eps).sqrt()
+            return -nearest_distance.clamp_min(self.eps).log().mean()
+
+
+class CovarianceLoss(nn.Module):
+    """VICReg-style squared off-diagonal sample covariance, scaled by dimension."""
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=embeddings.device.type, enabled=False):
+            embeddings = embeddings.float()
+            if embeddings.shape[0] < 2 or embeddings.shape[1] < 2:
+                return embeddings.sum() * 0.0
+            centered = embeddings - embeddings.mean(dim=0, keepdim=True)
+            covariance = centered.T @ centered / (embeddings.shape[0] - 1)
+            diagonal = covariance.diagonal()
+            off_diagonal_squared_sum = covariance.square().sum() - diagonal.square().sum()
+            return off_diagonal_squared_sum / covariance.shape[0]
+
+
 class BYOLLoss(nn.Module):
     """Symmetric BYOL regression with an EMA center for target embeddings."""
 

@@ -15,6 +15,7 @@ from minimal_dino.train import (
     _print_progress,
     cosine_center_scale,
     cosine_teacher_momentum,
+    embedding_covariance_metrics,
     load_max_logged_metric,
     log_metrics,
     remove_old_periodic_checkpoints,
@@ -48,7 +49,13 @@ class TinyEncoder(nn.Module):
 @pytest.mark.parametrize("objective", ["byol", "infonce"])
 @pytest.mark.parametrize(
     "uniformity_weight,uniformity_mode",
-    [(0.0, "normalized_mean"), (0.1, "normalized_mean"), (0.1, "decoupled")],
+    [
+        (0.0, "normalized_mean"),
+        (0.1, "normalized_mean"),
+        (0.1, "decoupled"),
+        (0.1, "koleo"),
+        (0.1, "covariance"),
+    ],
 )
 @pytest.mark.parametrize("resume_step", [0, 1])
 @pytest.mark.parametrize(
@@ -173,6 +180,8 @@ def test_training_applies_selected_augmentations(
     assert [record["step"] for record in metrics] == list(range(resume_step + 1, 4))
     assert all(torch.isfinite(torch.tensor(record["loss"])) for record in metrics)
     for record in metrics:
+        assert record["per_dim_variance_mean"] >= 0
+        assert record["covariance_squared_mean"] >= 0
         if uniformity_weight:
             assert record["weighted_uniformity_loss"] == pytest.approx(
                 uniformity_weight * record["uniformity_loss"], abs=1e-7
@@ -189,6 +198,22 @@ def test_training_applies_selected_augmentations(
     else:
         assert target_scales == []
         assert all("center_scale" not in record for record in metrics)
+
+
+def test_embedding_covariance_metrics_match_population_variance_and_sample_covariance():
+    embeddings = torch.tensor([[0.0, 0.0], [2.0, 4.0]], requires_grad=True)
+
+    per_dim_variance_mean, covariance_squared_mean = embedding_covariance_metrics(
+        embeddings
+    )
+
+    assert per_dim_variance_mean == pytest.approx(2.5)
+    assert covariance_squared_mean == pytest.approx(16.0)
+    assert not per_dim_variance_mean.requires_grad
+    assert not covariance_squared_mean.requires_grad
+
+    singleton_metrics = embedding_covariance_metrics(torch.tensor([[1.0, 2.0]]))
+    assert singleton_metrics == (torch.tensor(0.0), torch.tensor(0.0))
 
 
 def test_one_step_smoke_has_student_gradients_no_teacher_gradients_and_ema():
@@ -308,6 +333,33 @@ def test_uniformity_config_defaults_and_zero_t(objective):
     assert legacy_args.uniformity_mode == "normalized_mean"
     config.objective.uniformity_t = 0.0
     with pytest.raises(ValueError, match="objective.uniformity_t"):
+        to_train_args(config)
+
+
+@pytest.mark.parametrize(
+    "uniformity_mode", ["normalized_mean", "decoupled", "koleo", "covariance"]
+)
+def test_uniformity_config_accepts_supported_modes(uniformity_mode):
+    from minimal_dino.config import to_train_args
+
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        config = compose(
+            config_name="config",
+            overrides=[f"objective.uniformity_mode={uniformity_mode}"],
+        )
+
+    assert to_train_args(config).uniformity_mode == uniformity_mode
+
+
+def test_uniformity_config_rejects_unknown_mode():
+    from minimal_dino.config import to_train_args
+
+    with initialize_config_module(version_base="1.3", config_module="minimal_dino.conf"):
+        config = compose(
+            config_name="config", overrides=["objective.uniformity_mode=unknown"]
+        )
+
+    with pytest.raises(ValueError, match="objective.uniformity_mode"):
         to_train_args(config)
 
 
@@ -471,11 +523,28 @@ def test_log_metrics_writes_namespaced_tensorboard_scalars(tmp_path):
     assert writer.scalars == [("train/loss", 1.25, 4), ("train/lr", 3e-5, 4)]
     assert writer.flush_count == 1
 
+    log_metrics(
+        tmp_path,
+        {"step": 5, "head/embedding_std": 0.75},
+        quiet=True,
+        tensorboard_writer=writer,
+        namespace="eval",
+    )
+
+    assert writer.scalars[-1] == ("eval/head/embedding_std", 0.75, 5)
+    assert writer.flush_count == 2
+
 
 def test_progress_bar_finishes_with_newline(capsys):
-    _print_progress(2, 2, width=4)
+    _print_progress(2, 2, width=4, elapsed_seconds=2)
 
-    assert capsys.readouterr().out == "\rTraining [####] 2/2\n"
+    assert capsys.readouterr().out == "\rTraining [####] 2/2 ETA 00:00:00\n"
+
+
+def test_progress_bar_estimates_remaining_time(capsys):
+    _print_progress(2, 10, width=5, elapsed_seconds=20)
+
+    assert capsys.readouterr().out == "\rTraining [#----] 2/10 ETA 00:01:20"
 
 
 def test_save_run_artifacts_records_config_and_dirty_git_state(tmp_path, monkeypatch):

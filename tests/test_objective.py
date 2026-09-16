@@ -2,7 +2,14 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from minimal_dino.objective import BYOLLoss, InfoNCELoss, UniformityLoss, build_objective
+from minimal_dino.objective import (
+    BYOLLoss,
+    CovarianceLoss,
+    InfoNCELoss,
+    KoLeoLoss,
+    UniformityLoss,
+    build_objective,
+)
 
 
 def test_uniformity_matches_wang_formula_and_gradients():
@@ -61,6 +68,57 @@ def test_uniformity_prefers_spread_embeddings_and_handles_collapse():
 def test_uniformity_rejects_invalid_t(t):
     with pytest.raises(ValueError, match="uniformity t"):
         UniformityLoss(t)
+
+
+def test_koleo_matches_nearest_neighbor_entropy_estimator_and_gradients():
+    embeddings = torch.tensor(
+        [[2.0, 0.0], [1.0, 1.0], [-1.0, 1.0]], requires_grad=True
+    )
+
+    loss = KoLeoLoss()(embeddings)
+    normalized = F.normalize(embeddings, dim=-1)
+    distances = torch.cdist(normalized, normalized).masked_fill(
+        torch.eye(3, dtype=torch.bool), torch.inf
+    )
+    expected = -distances.min(dim=1).values.log().mean()
+    loss.backward()
+
+    torch.testing.assert_close(loss, expected)
+    assert torch.isfinite(embeddings.grad).all()
+    assert torch.count_nonzero(embeddings.grad) > 0
+
+
+def test_covariance_loss_matches_vicreg_scaling_and_gradients():
+    embeddings = torch.tensor([[0.0, 0.0], [2.0, 4.0]], requires_grad=True)
+
+    loss = CovarianceLoss()(embeddings)
+    loss.backward()
+
+    # Sample covariance is [[2, 4], [4, 8]], so (4^2 + 4^2) / dim = 16.
+    torch.testing.assert_close(loss, torch.tensor(16.0))
+    assert torch.isfinite(embeddings.grad).all()
+    assert torch.count_nonzero(embeddings.grad) > 0
+
+
+@pytest.mark.parametrize(
+    "loss_type,shape",
+    [
+        (KoLeoLoss, (0, 3)),
+        (KoLeoLoss, (1, 3)),
+        (CovarianceLoss, (0, 3)),
+        (CovarianceLoss, (1, 3)),
+        (CovarianceLoss, (3, 1)),
+    ],
+)
+def test_embedding_regularizers_without_required_pairs_are_differentiable_zero(
+    loss_type, shape
+):
+    embeddings = torch.randn(shape, requires_grad=True)
+    loss = loss_type()(embeddings)
+    loss.backward()
+
+    assert loss.item() == 0.0
+    torch.testing.assert_close(embeddings.grad, torch.zeros_like(embeddings))
 
 
 def test_byol_loss_matches_opposite_views_and_stops_teacher_gradient():

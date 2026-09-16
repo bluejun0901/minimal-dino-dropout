@@ -6,10 +6,12 @@ from datasets import Dataset
 import minimal_dino.evaluation as evaluation
 from minimal_dino.evaluation import (
     embedding_diagnostics,
+    encode_sentence_representations,
     encode_sentences,
     load_checkpoint,
     load_stsb_split,
     stsb_metrics,
+    stsb_metrics_with_head,
 )
 
 
@@ -99,6 +101,28 @@ def test_stsb_metrics_reports_alignment_for_scores_higher_than_point_eight():
     assert metrics["alignment"] == pytest.approx(0.0)
 
 
+def test_stsb_metrics_with_head_prefixes_all_projector_metrics():
+    embedding1 = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    embedding2 = torch.tensor([[0.0, 1.0], [0.0, 1.0], [1.0, -1.0]])
+    projection1 = torch.tensor([[2.0, 0.0], [1.0, 1.0], [-1.0, 0.0]])
+    projection2 = torch.tensor([[2.0, 0.0], [1.0, -1.0], [1.0, 0.0]])
+    scores = np.asarray([1.0, 0.5, 0.0])
+
+    metrics = stsb_metrics_with_head(
+        embedding1, embedding2, projection1, projection2, scores
+    )
+    expected_head = stsb_metrics(projection1, projection2, scores)
+
+    assert metrics["sts_spearman"] == stsb_metrics(
+        embedding1, embedding2, scores
+    )["sts_spearman"]
+    assert {name.removeprefix("head/") for name in metrics if name.startswith("head/")} == set(
+        expected_head
+    )
+    for name, value in expected_head.items():
+        assert metrics[f"head/{name}"] == pytest.approx(value, nan_ok=True)
+
+
 def test_encode_sentences_does_not_truncate():
     class RecordingTokenizer:
         def __init__(self):
@@ -124,6 +148,32 @@ def test_encode_sentences_does_not_truncate():
 
     assert tokenizer.options["truncation"] is False
     assert "max_length" not in tokenizer.options
+
+
+def test_encode_sentence_representations_returns_projector_output():
+    class Tokenizer:
+        def __call__(self, sentences, **options):
+            values = torch.arange(len(sentences) * 2).reshape(len(sentences), 2)
+            return {"input_ids": values, "attention_mask": torch.ones_like(values)}
+
+    class Model:
+        def eval(self):
+            return self
+
+        def __call__(self, input_ids, attention_mask, **kwargs):
+            assert kwargs == {"use_dropout": False, "target": True}
+            embedding = input_ids.float()
+            return type(
+                "Output",
+                (),
+                {"embedding": embedding, "projection": embedding + 10.0},
+            )()
+
+    embeddings, projections = encode_sentence_representations(
+        Model(), Tokenizer(), ["first", "second"], device=torch.device("cpu")
+    )
+
+    torch.testing.assert_close(projections, embeddings + 10.0)
 
 
 def test_stsb_metrics_reports_nan_alignment_without_positive_pairs():

@@ -93,8 +93,10 @@ def to_train_args(config: DictConfig) -> SimpleNamespace:
     uniformity_weight = objective.get("uniformity_weight", 0.0)
     uniformity_t = objective.get("uniformity_t", 2.0)
     uniformity_mode = objective.get("uniformity_mode", "normalized_mean")
-    if uniformity_mode not in {"normalized_mean", "decoupled"}:
-        raise ValueError("objective.uniformity_mode must be 'normalized_mean' or 'decoupled'")
+    uniformity_modes = {"normalized_mean", "decoupled", "koleo", "covariance"}
+    if uniformity_mode not in uniformity_modes:
+        choices = ", ".join(f"'{mode}'" for mode in sorted(uniformity_modes))
+        raise ValueError(f"objective.uniformity_mode must be one of: {choices}")
     for name, value, allow_zero in (
         ("uniformity_weight", uniformity_weight, True),
         ("uniformity_t", uniformity_t, False),

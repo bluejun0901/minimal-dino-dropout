@@ -1,4 +1,4 @@
-steps: 300
+steps: 150
 batch_size: 128
 limit: null
 stsb_dir: data/stsb

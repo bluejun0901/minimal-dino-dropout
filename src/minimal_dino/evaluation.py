@@ -53,10 +53,37 @@ def encode_sentences(
     return torch.cat(embeddings)
 
 
+@torch.inference_mode()
+def encode_sentence_representations(
+    model: SentenceBYOL,
+    tokenizer: Any,
+    sentences: list[str],
+    *,
+    device: torch.device,
+    batch_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return deterministic encoder embeddings and their projector outputs."""
+    model.eval()
+    loader = DataLoader(
+        sentences,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=TokenizeCollator(tokenizer, max_length=None),
+    )
+    embeddings = []
+    projections = []
+    for batch in loader:
+        batch = {name: value.to(device) for name, value in batch.items()}
+        output = model(**batch, use_dropout=False, target=True)
+        embeddings.append(output.embedding.cpu())
+        projections.append(output.projection.cpu())
+    return torch.cat(embeddings), torch.cat(projections)
+
+
 def embedding_diagnostics(
     embeddings: torch.Tensor,
 ) -> dict[str, float]:
-    """Cheap collapse indicators on deterministic, pre-head sentence embeddings."""
+    """Cheap collapse indicators on deterministic sentence representations."""
     normalized = F.normalize(embeddings.float(), dim=-1)
     n = normalized.shape[0]
     if n > 1:
@@ -117,6 +144,40 @@ def encode_stsb_dataset(
     return embedding1, embedding2, scores
 
 
+def encode_stsb_dataset_with_head(
+    model: SentenceBYOL,
+    tokenizer: Any,
+    dataset: Any,
+    *,
+    device: torch.device,
+    batch_size: int = 64,
+    limit: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+    """Encode STS-B pairs before and after the projector in one pass per sentence side."""
+    if limit is not None:
+        dataset = dataset.select(range(min(limit, len(dataset))))
+    sentence1 = list(dataset["sentence1"])
+    sentence2 = list(dataset["sentence2"])
+    score_column = "score" if "score" in dataset.column_names else "label"
+    scores = np.asarray(dataset[score_column], dtype=np.float64)
+
+    embedding1, projection1 = encode_sentence_representations(
+        model,
+        tokenizer,
+        sentence1,
+        device=device,
+        batch_size=batch_size,
+    )
+    embedding2, projection2 = encode_sentence_representations(
+        model,
+        tokenizer,
+        sentence2,
+        device=device,
+        batch_size=batch_size,
+    )
+    return embedding1, embedding2, projection1, projection2, scores
+
+
 def stsb_metrics(
     embedding1: torch.Tensor,
     embedding2: torch.Tensor,
@@ -138,6 +199,20 @@ def stsb_metrics(
         "alignment": alignment,
     }
     metrics.update(embedding_diagnostics(torch.cat((embedding1, embedding2))))
+    return metrics
+
+
+def stsb_metrics_with_head(
+    embedding1: torch.Tensor,
+    embedding2: torch.Tensor,
+    projection1: torch.Tensor,
+    projection2: torch.Tensor,
+    scores: np.ndarray,
+) -> dict[str, float]:
+    """Return encoder metrics plus projector metrics under the ``head/`` prefix."""
+    metrics = stsb_metrics(embedding1, embedding2, scores)
+    head_metrics = stsb_metrics(projection1, projection2, scores)
+    metrics.update({f"head/{name}": value for name, value in head_metrics.items()})
     return metrics
 
 
