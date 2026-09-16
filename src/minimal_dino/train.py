@@ -803,7 +803,7 @@ def train(
                     collapse_warning_emitted = True
 
             global_step += 1
-            if args.quiet:
+            if args.quiet and (should_log or global_step == total_steps):
                 _print_progress(
                     global_step,
                     total_steps,
